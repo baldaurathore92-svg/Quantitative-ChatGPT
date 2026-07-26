@@ -7,6 +7,7 @@ All configurable parameters loaded from config.json with sensible defaults.
 from dataclasses import dataclass, field
 from typing import Dict, Any, List
 import json
+import math
 from pathlib import Path
 
 from utils.types import MarketSubscription
@@ -56,6 +57,38 @@ class BufferConfig:
     price_history_size: int = 50
     spread_history_size: int = 30
     momentum_window: int = 20
+
+
+@dataclass
+class ContextConfig:
+    """Lifecycle limits for per-instrument mutable engine state."""
+
+    max_active_contexts: int = 256
+    idle_timeout_seconds: float = 1800.0
+    timing_window_size: int = 100
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_active_contexts, bool)
+            or not isinstance(self.max_active_contexts, int)
+            or self.max_active_contexts <= 0
+        ):
+            raise ValueError("max_active_contexts must be a positive integer")
+        if (
+            isinstance(self.idle_timeout_seconds, bool)
+            or not isinstance(self.idle_timeout_seconds, (int, float))
+            or not math.isfinite(self.idle_timeout_seconds)
+            or self.idle_timeout_seconds < 0
+        ):
+            raise ValueError(
+                "idle_timeout_seconds must be finite and non-negative"
+            )
+        if (
+            isinstance(self.timing_window_size, bool)
+            or not isinstance(self.timing_window_size, int)
+            or self.timing_window_size <= 0
+        ):
+            raise ValueError("timing_window_size must be a positive integer")
 
 
 @dataclass
@@ -204,6 +237,7 @@ class EngineConfig:
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     subscriptions: List[MarketSubscription] = field(default_factory=list)
+    context: ContextConfig = field(default_factory=ContextConfig)
     
     @classmethod
     def from_json(cls, path: str) -> 'EngineConfig':
@@ -237,6 +271,12 @@ class EngineConfig:
         if 'buffer' in data:
             config.buffer = BufferConfig(**{k: v for k, v in data['buffer'].items()
                                              if k in BufferConfig.__dataclass_fields__})
+
+        if 'context' in data:
+            config.context = ContextConfig(**{
+                k: v for k, v in data['context'].items()
+                if k in ContextConfig.__dataclass_fields__
+            })
         
         if 'ema' in data:
             config.ema = EMAConfig(**{k: v for k, v in data['ema'].items()

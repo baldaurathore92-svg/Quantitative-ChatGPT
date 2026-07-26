@@ -17,6 +17,7 @@ All operations are O(1) incremental for sub-millisecond latency.
 
 import math
 import time
+from collections import deque
 from typing import Dict, Optional, Any
 from dataclasses import dataclass, field
 
@@ -49,6 +50,14 @@ from engine.composite import CompositeCalculator, CompositeConfig
 from engine.execution import ExecutionModel, ExecutionConfig
 
 
+@dataclass
+class _ValidationHistory:
+    """Ordering history retained for one validated instrument."""
+
+    sequence: int = -1
+    timestamp: float = 0.0
+
+
 class SnapshotValidator:
     """
     Validates incoming snapshots.
@@ -65,7 +74,12 @@ class SnapshotValidator:
     - Price band violations
     """
     
-    def __init__(self, max_spread_ticks: float = 100.0, tick_size: float = 0.05):
+    def __init__(
+        self,
+        max_spread_ticks: float = 100.0,
+        tick_size: float = 0.05,
+        max_tracked_instruments: int = 1024
+    ):
         if (
             not isinstance(max_spread_ticks, (int, float))
             or isinstance(max_spread_ticks, bool)
@@ -80,22 +94,19 @@ class SnapshotValidator:
             or tick_size <= 0
         ):
             raise ValueError("tick_size must be finite and positive")
+        if (
+            isinstance(max_tracked_instruments, bool)
+            or not isinstance(max_tracked_instruments, int)
+            or max_tracked_instruments <= 0
+        ):
+            raise ValueError("max_tracked_instruments must be a positive integer")
         self._max_spread_ticks = max_spread_ticks
         self._tick_size = tick_size
-        self._last_sequence: Dict[str, int] = {}
-        self._last_timestamp: Dict[str, float] = {}
-        self._last_ltp: Dict[str, float] = {}
-        self._validation_count = 0  # For periodic cleanup
+        self._max_tracked_instruments = max_tracked_instruments
+        self._history: Dict[str, _ValidationHistory] = {}
     
     def validate(self, snapshot: Snapshot) -> ValidationResult:
-        """Validate snapshot with periodic cleanup."""
-        # Periodic cleanup to prevent unbounded growth
-        instrument_key = snapshot.instrument_key
-        self._validation_count += 1
-        if self._validation_count >= 1000:
-            self._cleanup_old_symbols(instrument_key)
-            self._validation_count = 0
-        
+        """Validate one snapshot against this context's previous snapshot."""
         # Check symbol and scalar fields
         if not isinstance(snapshot.symbol, str) or not snapshot.symbol.strip():
             return ValidationResult(valid=False, reason="Missing symbol")
@@ -117,8 +128,6 @@ class SnapshotValidator:
             )
         ):
             return ValidationResult(valid=False, reason="Invalid exchange type")
-
-        symbol = instrument_key
 
         if (
             not isinstance(snapshot.ltp, (int, float))
@@ -156,11 +165,11 @@ class SnapshotValidator:
             return ValidationResult(valid=False, reason="Missing depth")
 
         for side, levels in (('bid', snapshot.bids), ('ask', snapshot.asks)):
-            for index, level in enumerate(levels):
+            for level in levels:
                 if not isinstance(level, PriceLevel):
                     return ValidationResult(
                         valid=False,
-                        reason=f"Invalid {side} level at index {index}"
+                        reason=f"Invalid {side} level"
                     )
                 if (
                     not isinstance(level.price, (int, float))
@@ -170,7 +179,7 @@ class SnapshotValidator:
                 ):
                     return ValidationResult(
                         valid=False,
-                        reason=f"Invalid {side} price at level {index}"
+                        reason=f"Invalid {side} price"
                     )
                 if (
                     not isinstance(level.quantity, int)
@@ -179,7 +188,7 @@ class SnapshotValidator:
                 ):
                     return ValidationResult(
                         valid=False,
-                        reason=f"Invalid {side} quantity at level {index}"
+                        reason=f"Invalid {side} quantity"
                     )
                 if (
                     not isinstance(level.order_count, int)
@@ -189,7 +198,7 @@ class SnapshotValidator:
                 ):
                     return ValidationResult(
                         valid=False,
-                        reason=f"Invalid {side} order count at level {index}"
+                        reason=f"Invalid {side} order count"
                     )
 
         if any(
@@ -214,7 +223,7 @@ class SnapshotValidator:
         spread = best_ask.price - best_bid.price
         spread_ticks = spread / self._tick_size
         if not math.isfinite(spread_ticks) or spread_ticks > self._max_spread_ticks:
-            return ValidationResult(valid=False, reason=f"Spread too wide: {spread_ticks:.1f} ticks")
+            return ValidationResult(valid=False, reason="Spread too wide")
         
         # Check LTP is within bid-ask range (with tolerance for edge cases)
         mid = (best_bid.price + best_ask.price) / 2
@@ -224,58 +233,43 @@ class SnapshotValidator:
             # Log warning but don't reject (could be valid for illiquid stocks)
             pass  # Allow but could flag
         
-        # Check for stale/duplicate by sequence
-        last_seq = self._last_sequence.get(symbol, -1)
-        if snapshot.sequence > 0 and snapshot.sequence <= last_seq:
+        instrument_key = snapshot.instrument_key
+        history = self._history.get(instrument_key)
+
+        # Check for stale/duplicate by sequence within this instrument only.
+        if (
+            history is not None
+            and snapshot.sequence > 0
+            and snapshot.sequence <= history.sequence
+        ):
             return ValidationResult(valid=False, reason="Stale snapshot (sequence)")
         
-        # Check for timestamp going backwards significantly
-        last_ts = self._last_timestamp.get(symbol, 0)
-        if snapshot.timestamp > 0 and last_ts > 0:
-            if snapshot.timestamp < last_ts - 60:  # More than 60 seconds backwards
-                return ValidationResult(valid=False, reason="Timestamp anomaly")
-        
-        # Check for extreme price jump (circuit filter simulation)
-        last_ltp = self._last_ltp.get(symbol, 0)
-        if last_ltp > 0:
-            price_change_pct = abs(snapshot.ltp - last_ltp) / last_ltp
-            if price_change_pct > 0.20:  # 20% jump - possible circuit
-                # Log warning but don't reject (could be valid)
-                pass
-        
-        # Update tracking
-        self._last_sequence[symbol] = snapshot.sequence
-        self._last_timestamp[symbol] = snapshot.timestamp
-        self._last_ltp[symbol] = snapshot.ltp
+        # Check for timestamp going backwards significantly per instrument.
+        if (
+            history is not None
+            and snapshot.timestamp > 0
+            and history.timestamp > 0
+            and snapshot.timestamp < history.timestamp - 60
+        ):
+            return ValidationResult(valid=False, reason="Timestamp anomaly")
+
+        if history is None:
+            if len(self._history) >= self._max_tracked_instruments:
+                oldest_key = next(iter(self._history))
+                self._history.pop(oldest_key)
+            history = _ValidationHistory()
+        else:
+            # Reinsert below to keep dictionary order as least-recently-used.
+            self._history.pop(instrument_key)
+        history.sequence = snapshot.sequence
+        history.timestamp = snapshot.timestamp
+        self._history[instrument_key] = history
         
         return ValidationResult(valid=True, snapshot=snapshot)
     
     def reset(self) -> None:
-        """Clear all sequence and timestamp tracking."""
-        self._last_sequence.clear()
-        self._last_timestamp.clear()
-        self._last_ltp.clear()
-        self._validation_count = 0
-
-    def _cleanup_old_symbols(self, current_symbol: str) -> None:
-        """
-        Clean up old symbol tracking data.
-        
-        Keeps only current symbol and recently seen symbols.
-        """
-        # Keep only last 10 symbols to prevent unbounded growth
-        if len(self._last_sequence) > 10:
-            # Keep current symbol and 9 most recent
-            symbols_to_keep = {current_symbol}
-            for symbol in list(self._last_sequence.keys())[-9:]:
-                symbols_to_keep.add(symbol)
-            
-            # Remove others
-            for symbol in list(self._last_sequence.keys()):
-                if symbol not in symbols_to_keep:
-                    del self._last_sequence[symbol]
-                    self._last_timestamp.pop(symbol, None)
-                    self._last_ltp.pop(symbol, None)
+        """Clear ordering history for every tracked instrument."""
+        self._history.clear()
 
 
 @dataclass
@@ -297,8 +291,9 @@ class SymbolContext:
     state_machine: TradingStateMachine
     last_feature_values: Dict[str, FeatureResult] = field(default_factory=dict)
     last_composite: Optional[CompositeScore] = None
-    processing_times: list[float] = field(default_factory=list)
+    processing_times: deque[float] = field(default_factory=deque)
     snapshot_count: int = 0
+    last_seen_monotonic: float = field(default_factory=time.monotonic)
 
     def reset(self) -> None:
         """Reset this symbol without changing any other symbol context."""
@@ -354,8 +349,24 @@ class QuantEngine:
         # Initialize components
         self._init_components()
         
-        # Typed mutable state partitioned by symbol.
+        # Typed mutable state partitioned by exchange-qualified instrument key.
         self._contexts: Dict[str, SymbolContext] = {}
+        self._accepted_snapshot_count = 0
+        self._rejected_snapshot_count = 0
+        self._rejection_reasons: Dict[str, int] = {}
+        self._contexts_created = 0
+        self._contexts_evicted = 0
+        self._context_eviction_reasons: Dict[str, int] = {}
+        self._total_processing_time_ms = 0.0
+        idle_timeout = self._config.context.idle_timeout_seconds
+        self._context_cleanup_interval = (
+            min(60.0, max(0.01, idle_timeout / 4.0))
+            if idle_timeout > 0
+            else 0.0
+        )
+        self._next_context_cleanup = (
+            time.monotonic() + self._context_cleanup_interval
+        )
     
     def _validate_config(self) -> None:
         """Validate configuration values at startup."""
@@ -375,6 +386,30 @@ class QuantEngine:
         # Validate buffer sizes
         if self._config.buffer.default_size <= 0:
             errors.append(f"Invalid buffer size: {self._config.buffer.default_size}")
+
+        if (
+            isinstance(self._config.context.max_active_contexts, bool)
+            or not isinstance(self._config.context.max_active_contexts, int)
+            or self._config.context.max_active_contexts <= 0
+        ):
+            errors.append("context.max_active_contexts must be a positive integer")
+        if (
+            isinstance(self._config.context.idle_timeout_seconds, bool)
+            or not isinstance(
+                self._config.context.idle_timeout_seconds, (int, float)
+            )
+            or not math.isfinite(self._config.context.idle_timeout_seconds)
+            or self._config.context.idle_timeout_seconds < 0
+        ):
+            errors.append(
+                "context.idle_timeout_seconds must be finite and non-negative"
+            )
+        if (
+            isinstance(self._config.context.timing_window_size, bool)
+            or not isinstance(self._config.context.timing_window_size, int)
+            or self._config.context.timing_window_size <= 0
+        ):
+            errors.append("context.timing_window_size must be a positive integer")
         
         # Validate EMA taus
         if self._config.ema.momentum_tau <= 0:
@@ -538,17 +573,96 @@ class QuantEngine:
             threshold=DynamicThreshold(self._threshold_config),
             regime_detector=RegimeDetector(self._regime_config),
             composite=CompositeCalculator(self._composite_config),
-            state_machine=TradingStateMachine(self._state_machine_config)
+            state_machine=TradingStateMachine(self._state_machine_config),
+            processing_times=deque(
+                maxlen=self._config.context.timing_window_size
+            )
         )
 
+    @staticmethod
+    def _context_holds_position(context: SymbolContext) -> bool:
+        """Return whether evicting this context could lose position state."""
+        return context.state_machine.state in {
+            State.LONG,
+            State.SHORT,
+            State.EXIT_LONG,
+            State.EXIT_SHORT,
+        }
+
+    def _evict_context(self, instrument_key: str, reason: str) -> None:
+        """Remove one inactive context and record why it was removed."""
+        context = self._contexts.pop(instrument_key, None)
+        if context is None:
+            return
+        self._contexts_evicted += 1
+        self._context_eviction_reasons[reason] = (
+            self._context_eviction_reasons.get(reason, 0) + 1
+        )
+        self._logger.debug(
+            "Evicted instrument context",
+            instrument_key=instrument_key,
+            reason=reason,
+            active_contexts=len(self._contexts)
+        )
+
+    def _evict_idle_contexts(
+        self,
+        now: float,
+        exclude: Optional[str] = None,
+        force: bool = False
+    ) -> None:
+        """Periodically remove expired non-position contexts."""
+        idle_timeout = self._config.context.idle_timeout_seconds
+        if idle_timeout <= 0:
+            return
+        if not force and now < self._next_context_cleanup:
+            return
+        self._next_context_cleanup = now + self._context_cleanup_interval
+        idle_keys = [
+            key
+            for key, context in self._contexts.items()
+            if key != exclude
+            and now - context.last_seen_monotonic >= idle_timeout
+            and not self._context_holds_position(context)
+        ]
+        for key in idle_keys:
+            self._evict_context(key, "idle_timeout")
+
+    def _make_room_for_context(self, now: float) -> bool:
+        """Evict idle/LRU non-position contexts before admitting a new one."""
+        self._evict_idle_contexts(now, force=True)
+
+        maximum = self._config.context.max_active_contexts
+        while len(self._contexts) >= maximum:
+            candidates = [
+                (context.last_seen_monotonic, key)
+                for key, context in self._contexts.items()
+                if not self._context_holds_position(context)
+            ]
+            if not candidates:
+                return False
+            _, oldest_key = min(candidates)
+            self._evict_context(oldest_key, "capacity_lru")
+        return True
+
+    def _record_rejection(self, reason: str) -> None:
+        """Increment bounded rejection diagnostics."""
+        self._rejected_snapshot_count += 1
+        self._rejection_reasons[reason] = self._rejection_reasons.get(reason, 0) + 1
+
     def process(self, snapshot: Snapshot) -> Optional[CompositeScore]:
-        """Process one snapshot entirely within its symbol context."""
+        """Process one snapshot entirely within its instrument context."""
         start_time = time.perf_counter()
+        now = time.monotonic()
         if not isinstance(snapshot.symbol, str) or not snapshot.symbol.strip():
-            self._logger.debug("Snapshot rejected: Missing symbol")
+            self._evict_idle_contexts(now)
+            reason = "Missing symbol"
+            self._record_rejection(reason)
+            self._logger.debug("Snapshot rejected", reason=reason)
             return None
 
         instrument_key = snapshot.instrument_key
+        self._evict_idle_contexts(now, exclude=instrument_key)
         context = self._contexts.get(instrument_key)
         is_new_context = context is None
         if context is None:
@@ -556,10 +670,29 @@ class QuantEngine:
 
         validation = context.validator.validate(snapshot)
         if not validation.valid:
-            self._logger.debug(f"Snapshot rejected: {validation.reason}")
+            reason = validation.reason or "Unknown validation failure"
+            self._record_rejection(reason)
+            self._logger.debug(
+                "Snapshot rejected",
+                instrument_key=instrument_key,
+                reason=reason
+            )
             return None
+
         if is_new_context:
+            if not self._make_room_for_context(now):
+                reason = "Context capacity reserved by active positions"
+                self._record_rejection(reason)
+                self._logger.warning(
+                    "Snapshot rejected",
+                    instrument_key=instrument_key,
+                    reason=reason,
+                    active_contexts=len(self._contexts)
+                )
+                return None
             self._contexts[instrument_key] = context
+            self._contexts_created += 1
+        context.last_seen_monotonic = now
 
         prev_book = context.market_state.prev_book
         features = self._calculate_features(context, snapshot, prev_book)
@@ -608,20 +741,19 @@ class QuantEngine:
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         context.processing_times.append(elapsed_ms)
-        if len(context.processing_times) > 100:
-            context.processing_times.pop(0)
         context.snapshot_count += 1
+        self._accepted_snapshot_count += 1
+        self._total_processing_time_ms += elapsed_ms
 
-        total_snapshot_count = sum(ctx.snapshot_count for ctx in self._contexts.values())
-        if total_snapshot_count % 100 == 0:
-            all_times = [
-                duration
-                for ctx in self._contexts.values()
-                for duration in ctx.processing_times
-            ]
+        if self._accepted_snapshot_count % 100 == 0:
             self._logger.debug(
-                f"Processed {total_snapshot_count} snapshots",
-                avg_time_ms=sum(all_times) / len(all_times) if all_times else 0.0
+                "Processed snapshots",
+                snapshot_count=self._accepted_snapshot_count,
+                avg_time_ms=(
+                    self._total_processing_time_ms
+                    / self._accepted_snapshot_count
+                ),
+                active_contexts=len(self._contexts)
             )
 
         return composite
@@ -796,6 +928,13 @@ class QuantEngine:
 
         for context in self._contexts.values():
             context.reset()
+        self._accepted_snapshot_count = 0
+        self._rejected_snapshot_count = 0
+        self._rejection_reasons.clear()
+        self._contexts_created = len(self._contexts)
+        self._contexts_evicted = 0
+        self._context_eviction_reasons.clear()
+        self._total_processing_time_ms = 0.0
 
     def _get_context_stats(self, context: SymbolContext) -> Dict[str, Any]:
         processing_times = context.processing_times
@@ -814,7 +953,11 @@ class QuantEngine:
             'avg_processing_time_ms': avg_time,
             'state': context.state_machine.state.name,
             'regime': context.regime_detector.current_regime.name,
-            'threshold': threshold
+            'threshold': threshold,
+            'idle_seconds': max(
+                0.0,
+                time.monotonic() - context.last_seen_monotonic
+            )
         }
 
     def get_stats(
@@ -832,6 +975,7 @@ class QuantEngine:
                     'state': State.WARMUP.name,
                     'regime': Regime.NOISE.name,
                     'threshold': self._threshold_config.base_threshold,
+                    'idle_seconds': 0.0,
                     'symbols_tracked': len(self._contexts)
                 }
             stats = self._get_context_stats(context)
@@ -845,15 +989,24 @@ class QuantEngine:
             context_symbol: self._get_context_stats(context)
             for context_symbol, context in self._contexts.items()
         }
-        total_count = sum(
+        current_snapshot_count = sum(
             context.snapshot_count for context in self._contexts.values()
         )
-        all_times = [
+        rolling_times = [
             duration
             for context in self._contexts.values()
             for duration in context.processing_times
         ]
-        avg_time = sum(all_times) / len(all_times) if all_times else 0.0
+        avg_time = (
+            sum(rolling_times) / len(rolling_times)
+            if rolling_times
+            else 0.0
+        )
+        lifetime_avg_time = (
+            self._total_processing_time_ms / self._accepted_snapshot_count
+            if self._accepted_snapshot_count
+            else 0.0
+        )
 
         if len(self._contexts) == 1:
             only_stats = next(iter(symbol_stats.values()))
@@ -870,12 +1023,22 @@ class QuantEngine:
             threshold = self._threshold_config.base_threshold
 
         return {
-            'snapshot_count': total_count,
+            'snapshot_count': current_snapshot_count,
+            'accepted_snapshot_count': self._accepted_snapshot_count,
+            'rejected_snapshot_count': self._rejected_snapshot_count,
             'avg_processing_time_ms': avg_time,
+            'lifetime_avg_processing_time_ms': lifetime_avg_time,
             'state': state,
             'regime': regime,
             'threshold': threshold,
             'symbols_tracked': len(self._contexts),
+            'contexts_created': self._contexts_created,
+            'contexts_evicted': self._contexts_evicted,
+            'max_active_contexts': self._config.context.max_active_contexts,
+            'rejection_reasons': dict(self._rejection_reasons),
+            'context_eviction_reasons': dict(
+                self._context_eviction_reasons
+            ),
             'symbols': symbol_stats
         }
 
