@@ -85,8 +85,12 @@ class RollingEMA:
                 valid=True
             )
         
-        # Calculate time delta
-        dt = timestamp - self._last_timestamp
+        # Calculate time delta after initialization established the state.
+        last_timestamp = self._last_timestamp
+        current_ema = self._ema
+        if last_timestamp is None or current_ema is None:
+            raise RuntimeError("initialized EMA is missing state")
+        dt = timestamp - last_timestamp
         if dt < 0:
             # Timestamp went backwards - reset
             self._ema = value
@@ -102,7 +106,7 @@ class RollingEMA:
         alpha = 1.0 - math.exp(-dt / self._tau)
         
         # Update EMA
-        self._ema = alpha * value + (1.0 - alpha) * self._ema
+        self._ema = alpha * value + (1.0 - alpha) * current_ema
         self._last_timestamp = timestamp
         self._count += 1
         
@@ -177,8 +181,8 @@ class DualEMA:
         
         self._fast_ema = RollingEMA(fast_tau)
         self._slow_ema = RollingEMA(slow_tau)
-        self._prev_fast = None
-        self._prev_slow = None
+        self._prev_fast: Optional[float] = None
+        self._prev_slow: Optional[float] = None
     
     @property
     def fast(self) -> float:

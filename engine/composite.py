@@ -9,11 +9,11 @@ The composite is ALWAYS normalized to [-1, +1].
 """
 
 from typing import Dict, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import time
 
-from utils.types import Snapshot, PriceKeyedBook, FeatureResult, CompositeScore, Regime
-from utils.math_utils import clamp, safe_divide
+from utils.types import FeatureResult, CompositeScore, Regime
+from utils.math_utils import clamp
 from utils.constants import EPSILON
 
 
@@ -21,21 +21,17 @@ from utils.constants import EPSILON
 class CompositeConfig:
     """Configuration for composite calculation."""
     # Feature weights (relative importance)
-    weights: Dict[str, float] = None
-    
-    def __post_init__(self):
-        if self.weights is None:
-            self.weights = {
-                'microprice': 1.0,
-                'weighted_obi': 1.2,
-                'depth_slope': 0.6,
-                'spread_compression': 0.4,
-                'queue_persistence': 0.5,
-                'momentum': 0.8,
-                'acceleration': 0.4,
-                'refill_proxy': 0.3,
-                'ltp_confirmation': 0.2
-            }
+    weights: Dict[str, float] = field(default_factory=lambda: {
+        'microprice': 1.0,
+        'weighted_obi': 1.2,
+        'depth_slope': 0.6,
+        'spread_compression': 0.4,
+        'queue_persistence': 0.5,
+        'momentum': 0.8,
+        'acceleration': 0.4,
+        'refill_proxy': 0.3,
+        'ltp_confirmation': 0.2
+    })
 
 
 class CompositeCalculator:
@@ -255,7 +251,9 @@ def calculate_composite(
     Returns:
         Tuple of (composite_value, confidence)
     """
-    config = CompositeConfig(weights=weights)
+    config = CompositeConfig()
+    if weights is not None:
+        config.weights = weights
     calc = CompositeCalculator(config)
     score = calc.calculate(features, Regime.NOISE)
     return score.value, score.confidence

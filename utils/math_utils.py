@@ -6,7 +6,7 @@ No O(N) scans inside hot paths.
 """
 
 import math
-from typing import Tuple, Optional
+from typing import Tuple
 from .constants import EPSILON
 
 

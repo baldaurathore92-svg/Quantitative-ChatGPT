@@ -10,7 +10,6 @@ Tests all major components:
 
 import unittest
 import time
-from typing import Tuple
 
 # Import engine components
 from config import EngineConfig
@@ -289,7 +288,6 @@ class TestFullEngine(unittest.TestCase):
     def test_engine_processing(self):
         """Test full engine processing."""
         from engine.quant_engine import QuantEngine
-        from config import EngineConfig
         
         config = EngineConfig()
         engine = QuantEngine(config)
@@ -310,7 +308,6 @@ class TestFullEngine(unittest.TestCase):
     def test_engine_reset(self):
         """Test engine reset."""
         from engine.quant_engine import QuantEngine
-        from config import EngineConfig
         
         config = EngineConfig()
         engine = QuantEngine(config)

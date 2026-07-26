@@ -20,7 +20,7 @@ from typing import Optional, List, Tuple
 from dataclasses import dataclass
 
 from utils.types import Snapshot, PriceKeyedBook, FeatureResult, RollingStats, PriceLevel
-from utils.math_utils import clamp, safe_divide, exponential_decay_weight
+from utils.math_utils import clamp, exponential_decay_weight
 from utils.constants import OBI_RANGE
 
 

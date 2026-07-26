@@ -12,8 +12,8 @@ All state mutations are protected by threading.Lock().
 """
 
 from typing import Optional, Dict, List
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
+import math
 import time
 import threading
 
@@ -84,18 +84,25 @@ class TradingStateMachine:
         self._consecutive_bearish = 0
         self._last_composite = 0.0
         
-        # Transition history
+        # Transition history and one-shot command for the latest update.
         self._transitions: List[StateTransition] = []
+        self._pending_signal_type: Optional[SignalType] = None
     
     def update(
         self,
         composite_value: float,
         confidence: float,
         regime: str,
-        timestamp: Optional[float] = None
+        timestamp: Optional[float] = None,
+        activation_threshold: Optional[float] = None
     ) -> State:
         """
         Update state machine with new composite.
+
+        ``activation_threshold`` overrides the configured position threshold for
+        directional tracking and entry confirmation. The watch threshold keeps
+        the configured watch/position ratio, while exits continue to use the
+        configured exit threshold and minimum hold time.
         
         Thread-safe: Uses lock to protect state mutations.
         
@@ -104,32 +111,49 @@ class TradingStateMachine:
             confidence: Signal confidence [0, 1]
             regime: Current market regime
             timestamp: Current timestamp (defaults to current time)
+            activation_threshold: Optional per-update directional entry threshold
         
         Returns:
             Current state
         """
         with self._lock:
-            return self._update_internal(composite_value, confidence, regime, timestamp)
+            return self._update_internal(
+                composite_value,
+                confidence,
+                regime,
+                timestamp,
+                activation_threshold
+            )
     
     def _update_internal(
         self,
         composite_value: float,
         confidence: float,
         regime: str,
-        timestamp: Optional[float]
+        timestamp: Optional[float],
+        activation_threshold: Optional[float]
     ) -> State:
         """Internal update (must be called with lock held)."""
         if timestamp is None:
             timestamp = time.time()
-        
+
+        entry_threshold, watch_threshold = self._resolve_activation_thresholds(
+            activation_threshold
+        )
+
+        # A command belongs only to the transition produced by this update.
+        # If it was not consumed, advancing the machine expires it rather than
+        # allowing a stale or failed command to be retried indefinitely.
+        self._pending_signal_type = None
+
         self._sample_count += 1
         self._last_composite = composite_value
         
-        # Track signal direction
-        if composite_value > self._config.watch_threshold:
+        # Track signal direction using the same activation policy as entry.
+        if composite_value >= watch_threshold:
             self._consecutive_bullish += 1
             self._consecutive_bearish = 0
-        elif composite_value < -self._config.watch_threshold:
+        elif composite_value <= -watch_threshold:
             self._consecutive_bearish += 1
             self._consecutive_bullish = 0
         else:
@@ -138,7 +162,7 @@ class TradingStateMachine:
         
         # Process based on current state
         new_state = self._process_state(
-            composite_value, confidence, regime, timestamp
+            composite_value, confidence, regime, timestamp, entry_threshold
         )
         
         # Handle state transition
@@ -146,13 +170,37 @@ class TradingStateMachine:
             self._transition(new_state, composite_value, timestamp)
         
         return self._state
+
+    def _resolve_activation_thresholds(
+        self,
+        activation_threshold: Optional[float]
+    ) -> tuple[float, float]:
+        """Return safe entry/watch thresholds for one update."""
+        configured_entry = self._config.position_threshold
+        if (
+            activation_threshold is None
+            or isinstance(activation_threshold, bool)
+            or not isinstance(activation_threshold, (int, float))
+            or not math.isfinite(activation_threshold)
+        ):
+            return configured_entry, self._config.watch_threshold
+
+        entry_threshold = min(1.0, max(0.0, float(activation_threshold)))
+        if configured_entry > 0 and math.isfinite(configured_entry):
+            watch_ratio = self._config.watch_threshold / configured_entry
+        else:
+            watch_ratio = 1.0
+        watch_ratio = min(1.0, max(0.0, watch_ratio))
+        watch_threshold = entry_threshold * watch_ratio
+        return entry_threshold, watch_threshold
     
     def _process_state(
         self,
         composite: float,
         confidence: float,
         regime: str,
-        timestamp: float
+        timestamp: float,
+        entry_threshold: float
     ) -> State:
         """Process state transitions."""
         
@@ -181,7 +229,7 @@ class TradingStateMachine:
                     return State.NEUTRAL
             
             # Check for confirmation
-            if composite > self._config.position_threshold and confidence > 0.5:
+            if composite >= entry_threshold and confidence > 0.5:
                 self._position_start_time = timestamp
                 return State.LONG
             
@@ -200,7 +248,7 @@ class TradingStateMachine:
                     return State.NEUTRAL
             
             # Check for confirmation
-            if composite < -self._config.position_threshold and confidence > 0.5:
+            if composite <= -entry_threshold and confidence > 0.5:
                 self._position_start_time = timestamp
                 return State.SHORT
             
@@ -265,7 +313,15 @@ class TradingStateMachine:
             reason=self._get_transition_reason(old_state, new_state)
         )
         self._transitions.append(transition)
-        
+
+        command_by_transition = {
+            (State.WATCH_LONG, State.LONG): SignalType.BULLISH,
+            (State.WATCH_SHORT, State.SHORT): SignalType.BEARISH,
+            (State.LONG, State.EXIT_LONG): SignalType.EXIT_LONG,
+            (State.SHORT, State.EXIT_SHORT): SignalType.EXIT_SHORT,
+        }
+        self._pending_signal_type = command_by_transition.get((old_state, new_state))
+
         # Update state
         self._state = new_state
         self._state_enter_time = timestamp
@@ -326,13 +382,24 @@ class TradingStateMachine:
         with self._lock:
             return time.time() - self._state_enter_time
     
-    def get_signal_type(self) -> SignalType:
-        """Get current signal type (thread-safe)."""
+    def consume_execution_signal_type(self) -> Optional[SignalType]:
+        """Consume the command created by the latest qualifying transition."""
         with self._lock:
-            if self._state == State.LONG or self._state == State.WATCH_LONG:
+            signal_type = self._pending_signal_type
+            self._pending_signal_type = None
+            return signal_type
+
+    def get_signal_type(self) -> SignalType:
+        """Get the directional signal represented by the current state."""
+        with self._lock:
+            if self._state in (State.LONG, State.WATCH_LONG):
                 return SignalType.BULLISH
-            elif self._state == State.SHORT or self._state == State.WATCH_SHORT:
+            if self._state in (State.SHORT, State.WATCH_SHORT):
                 return SignalType.BEARISH
+            if self._state == State.EXIT_LONG:
+                return SignalType.EXIT_LONG
+            if self._state == State.EXIT_SHORT:
+                return SignalType.EXIT_SHORT
         return SignalType.NEUTRAL
     
     def reset(self) -> None:
@@ -346,6 +413,7 @@ class TradingStateMachine:
             self._consecutive_bullish = 0
             self._consecutive_bearish = 0
             self._last_composite = 0.0
+            self._pending_signal_type = None
             self._transitions.clear()
     
     def force_state(self, state: State) -> None:
@@ -353,6 +421,7 @@ class TradingStateMachine:
         with self._lock:
             self._state = state
             self._state_enter_time = time.time()
+            self._pending_signal_type = None
     
     def get_transitions(self, limit: int = 10) -> List[StateTransition]:
         """Get recent transitions (thread-safe)."""

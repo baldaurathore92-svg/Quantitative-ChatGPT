@@ -10,12 +10,10 @@ Determines current market state:
 Uses deterministic rules only. No machine learning.
 """
 
-from typing import Optional, Tuple, Dict
+from typing import Optional, Dict
 from dataclasses import dataclass
-from enum import Enum
 
-from utils.types import Snapshot, Regime, RollingStats
-from utils.math_utils import clamp
+from utils.types import Regime
 from buffers.rolling_variance import RollingVariance
 from buffers.rolling_mean import RollingMean
 from utils.constants import (
@@ -255,10 +253,16 @@ class RegimeFeatureWeights:
     - NOISE: Reduce relative weight of noisy features
     """
     
-    def __init__(self):
-        # Base relative weights (all 1.0 = equal importance)
-        # These multiply the base weights from config
-        self._regime_adjustments = {
+    def __init__(
+        self,
+        trend: Optional[Dict[str, float]] = None,
+        pullback: Optional[Dict[str, float]] = None,
+        range_weights: Optional[Dict[str, float]] = None,
+        noise: Optional[Dict[str, float]] = None
+    ):
+        # Callers may supply configured relative multipliers. Standalone use
+        # retains the historical defaults.
+        defaults = {
             Regime.TREND: {
                 'microprice': 0.8,
                 'weighted_obi': 1.2,
@@ -304,6 +308,20 @@ class RegimeFeatureWeights:
                 'ltp_confirmation': 1.1
             }
         }
+        configured = {
+            Regime.TREND: trend,
+            Regime.PULLBACK: pullback,
+            Regime.RANGE: range_weights,
+            Regime.NOISE: noise,
+        }
+        self._regime_adjustments = {
+            regime: dict(weights) if weights is not None else defaults[regime]
+            for regime, weights in configured.items()
+        }
+
+    def get_weight_adjustments(self, regime: Regime) -> Dict[str, float]:
+        """Get configured relative multipliers for a regime."""
+        return dict(self._regime_adjustments.get(regime, {}))
     
     def get_adjusted_weights(
         self,

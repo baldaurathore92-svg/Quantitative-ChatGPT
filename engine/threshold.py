@@ -11,13 +11,11 @@ Threshold adapts to market conditions:
 The threshold determines when a composite score is actionable.
 """
 
-from typing import Optional, Dict
+from typing import Dict
 from dataclasses import dataclass
 
-from utils.types import Snapshot, RollingStats
-from utils.math_utils import clamp, safe_divide
+from utils.math_utils import clamp
 from buffers.rolling_variance import RollingVariance
-from buffers.monotonic_queue import RollingMinMax
 from utils.constants import MIN_THRESHOLD, MAX_THRESHOLD
 
 

@@ -6,7 +6,7 @@ Structured logging with performance tracking.
 
 import logging
 import time
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 from contextlib import contextmanager
 from functools import wraps
 import json

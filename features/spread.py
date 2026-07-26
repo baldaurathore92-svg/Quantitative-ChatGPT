@@ -6,11 +6,9 @@ Various spread-related metrics for market quality assessment.
 
 from typing import Optional, Tuple
 from dataclasses import dataclass
-import math
 
 from utils.types import Snapshot, PriceKeyedBook, FeatureResult, RollingStats
-from utils.math_utils import clamp, safe_divide
-from utils.constants import MAX_SPREAD_RATIO
+from utils.math_utils import clamp
 
 
 @dataclass
@@ -66,8 +64,7 @@ class SpreadCalculator:
             )
         
         spread_ticks = spread / self._config.tick_size
-        mid = snapshot.mid_price
-        
+
         # Spread quality: inverse, normalized
         # 1 tick spread = 1.0 quality
         # 5 tick spread = 0.5 quality

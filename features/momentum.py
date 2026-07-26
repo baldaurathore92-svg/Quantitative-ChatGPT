@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import math
 
 from utils.types import Snapshot, PriceKeyedBook, FeatureResult, RollingStats
-from utils.math_utils import clamp, time_aware_ema_alpha, update_ema
+from utils.math_utils import clamp
 from buffers.rolling_ema import RollingEMA
 from utils.constants import MOMENTUM_RANGE
 

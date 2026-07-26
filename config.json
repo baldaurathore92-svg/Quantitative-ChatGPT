@@ -7,7 +7,8 @@
     "heartbeat_interval": 10.0,
     "reconnect_delay": 5.0,
     "max_reconnect_attempts": 10,
-    "snapshot_timeout": 30.0
+    "snapshot_timeout": 30.0,
+    "correlation_id": "snapquote1"
   },
   "tick": {
     "tick_size": 0.05,
@@ -95,5 +96,5 @@
     "max_file_size": 10485760,
     "backup_count": 5
   },
-  "symbols": ["RELIANCE", "TCS", "INFY"]
+  "subscriptions": []
 }

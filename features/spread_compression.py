@@ -15,7 +15,7 @@ from typing import Optional, Tuple
 from dataclasses import dataclass
 
 from utils.types import Snapshot, PriceKeyedBook, FeatureResult, RollingStats
-from utils.math_utils import clamp, safe_divide
+from utils.math_utils import clamp
 from buffers.ring_buffer import NumericRingBuffer
 from utils.constants import SPREAD_COMPRESSION_RANGE
 
@@ -133,12 +133,14 @@ class SpreadCompressionCalculator:
         
         # Linear mapping: (ratio - 1) / range
         deviation = compression_ratio - 1.0
-        normalized = -deviation / 0.5  # Invert: compression is bullish
+        normalized = -deviation / self._config.compression_threshold
         normalized = clamp(normalized, -1.0, 1.0)
         
         # Confidence based on sample count and consistency
-        stats = self._spread_buffer.get_stats()
-        confidence = self._calculate_confidence(stats.count, stats.std, avg_spread)
+        buffer_stats = self._spread_buffer.get_stats()
+        confidence = self._calculate_confidence(
+            buffer_stats.count, buffer_stats.std, avg_spread
+        )
         
         return FeatureResult(
             value=normalized,

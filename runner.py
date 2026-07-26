@@ -6,13 +6,16 @@ with different configurations.
 """
 
 import time
-from typing import Optional, List, Callable
+from typing import Optional, Callable, Sequence
 
 from config import EngineConfig
 from engine.quant_engine import QuantEngine
 from adapter.angel_v2 import SmartAPIConfig, AngelOneWebSocket
 from adapter.replay import ReplayAdapter, ReplayConfig, create_mock_snapshot
-from utils.types import Snapshot, CompositeScore, ExecutionSignal
+from utils.types import (
+    Snapshot, CompositeScore, ExecutionSignal, SnapshotDeliveryMode,
+    MarketSubscription
+)
 from utils.logging_utils import StructuredLogger
 
 
@@ -70,14 +73,20 @@ class QuantEngineRunner:
         if composite and self._on_composite:
             self._on_composite(composite)
         
-        if composite and composite.is_actionable(composite.threshold_used):
+        if composite:
+            # Always ask the state machine for its one-shot transition command;
+            # exits may occur below the outer composite activation threshold.
             signal = self._engine.get_execution_signal(snapshot, composite)
             if signal and self._on_signal:
                 self._on_signal(signal)
         
         return composite
     
-    def process_mock(self, symbol: str = 'TEST', ltp: float = 100.0) -> CompositeScore:
+    def process_mock(
+        self,
+        symbol: str = 'TEST',
+        ltp: float = 100.0
+    ) -> Optional[CompositeScore]:
         """
         Process a mock snapshot for testing.
         
@@ -100,7 +109,7 @@ class QuantEngineRunner:
     
     def run_live(
         self,
-        symbols: List[str],
+        subscriptions: Optional[Sequence[MarketSubscription]] = None,
         on_signal: Optional[Callable[[ExecutionSignal], None]] = None,
         on_disconnect: Optional[Callable[[], None]] = None
     ) -> None:
@@ -108,12 +117,21 @@ class QuantEngineRunner:
         Run with live Angel One data.
         
         Args:
-            symbols: List of symbols to subscribe
+            subscriptions: Exchange/token pairs; defaults to configured subscriptions
             on_signal: Signal callback
             on_disconnect: Disconnect callback
         """
         if on_signal:
             self._on_signal = on_signal
+
+        selected_subscriptions = (
+            tuple(subscriptions)
+            if subscriptions is not None
+            else tuple(self._config.subscriptions)
+        )
+        if not selected_subscriptions:
+            self._logger.error("At least one live subscription is required")
+            return
         
         # Create WebSocket adapter
         api_config = SmartAPIConfig(
@@ -123,10 +141,15 @@ class QuantEngineRunner:
             feed_token=self._config.api.feed_token,
             heartbeat_interval=self._config.api.heartbeat_interval,
             reconnect_delay=self._config.api.reconnect_delay,
-            max_reconnect_attempts=self._config.api.max_reconnect_attempts
+            max_reconnect_attempts=self._config.api.max_reconnect_attempts,
+            snapshot_timeout=self._config.api.snapshot_timeout,
+            correlation_id=self._config.api.correlation_id,
         )
         
-        ws = AngelOneWebSocket(api_config)
+        ws = AngelOneWebSocket(
+            api_config,
+            delivery_mode=SnapshotDeliveryMode.CALLBACK
+        )
         
         def on_snapshot(snapshot: Snapshot):
             self.process_snapshot(snapshot)
@@ -135,11 +158,14 @@ class QuantEngineRunner:
         ws.on_disconnect = on_disconnect
         
         if ws.connect():
-            ws.subscribe(symbols)
+            if not ws.subscribe(selected_subscriptions):
+                self._logger.error("Failed to subscribe to configured tokens")
+                ws.disconnect()
+                return
             
-            # Keep running
+            # Keep running through transient disconnects while the adapter retries.
             try:
-                while ws.is_connected:
+                while ws.running:
                     time.sleep(1)
             except KeyboardInterrupt:
                 pass
@@ -174,7 +200,10 @@ class QuantEngineRunner:
             skip_invalid=True
         )
         
-        replay = ReplayAdapter(config)
+        replay = ReplayAdapter(
+            config,
+            delivery_mode=SnapshotDeliveryMode.CALLBACK
+        )
         
         def on_snapshot(snapshot: Snapshot):
             self.process_snapshot(snapshot)
