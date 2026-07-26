@@ -30,6 +30,14 @@
     "idle_timeout_seconds": 1800.0,
     "timing_window_size": 100
   },
+  "regime_detection": {
+    "momentum_threshold": 0.5,
+    "obi_threshold": 0.4,
+    "spread_threshold": 0.3,
+    "vol_threshold": 0.7,
+    "trend_persistence": 3,
+    "noise_persistence": 5
+  },
   "ema": {
     "short_tau": 5.0,
     "medium_tau": 15.0,

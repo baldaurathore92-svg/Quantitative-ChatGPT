@@ -10,6 +10,12 @@ import json
 import math
 from pathlib import Path
 
+from utils.constants import (
+    NOISE_VOL_THRESHOLD,
+    RANGE_SPREAD_THRESHOLD,
+    TREND_MOMENTUM_THRESHOLD,
+    TREND_OBI_THRESHOLD,
+)
 from utils.types import MarketSubscription
 
 
@@ -177,6 +183,38 @@ class RegimeConfidenceConfig:
 
 
 @dataclass
+class RegimeDetectionConfig:
+    """Market regime classifier thresholds and persistence."""
+
+    momentum_threshold: float = TREND_MOMENTUM_THRESHOLD
+    obi_threshold: float = TREND_OBI_THRESHOLD
+    spread_threshold: float = RANGE_SPREAD_THRESHOLD
+    vol_threshold: float = NOISE_VOL_THRESHOLD
+    trend_persistence: int = 3
+    noise_persistence: int = 5
+
+    def __post_init__(self) -> None:
+        for name in (
+            "momentum_threshold",
+            "obi_threshold",
+            "spread_threshold",
+            "vol_threshold",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(f"{name} must be finite and non-negative")
+        for name in ("trend_persistence", "noise_persistence"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+
+
+@dataclass
 class StateMachineConfig:
     """State machine configuration."""
     warmup_samples: int = 10
@@ -238,6 +276,9 @@ class EngineConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     subscriptions: List[MarketSubscription] = field(default_factory=list)
     context: ContextConfig = field(default_factory=ContextConfig)
+    regime_detection: RegimeDetectionConfig = field(
+        default_factory=RegimeDetectionConfig
+    )
     
     @classmethod
     def from_json(cls, path: str) -> 'EngineConfig':
@@ -276,6 +317,12 @@ class EngineConfig:
             config.context = ContextConfig(**{
                 k: v for k, v in data['context'].items()
                 if k in ContextConfig.__dataclass_fields__
+            })
+
+        if 'regime_detection' in data:
+            config.regime_detection = RegimeDetectionConfig(**{
+                k: v for k, v in data['regime_detection'].items()
+                if k in RegimeDetectionConfig.__dataclass_fields__
             })
         
         if 'ema' in data:
