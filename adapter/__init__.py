@@ -1,19 +1,26 @@
-"""
-Adapter package for Snapshot Quant Engine.
+"""Adapter package for live, replay, and deterministic simulation data."""
 
-Data source adapters for live and replay data.
-"""
-
-from .angel_v2 import (
-    SmartAPIConfig, SmartAPIParser, AngelOneWebSocket
+from .angel_v2 import AngelOneWebSocket, SmartAPIConfig, SmartAPIParser
+from .market_scenarios import (
+    MarketPattern,
+    MarketScenarioConfig,
+    TickMarketGenerator,
+    continue_market_scenario,
+    generate_market_scenario,
 )
-from .replay import (
-    ReplayConfig, ReplayAdapter, SnapshotRecorder, create_mock_snapshot
-)
+from .replay import ReplayAdapter, ReplayConfig, SnapshotRecorder, create_mock_snapshot
 
 __all__ = [
-    # Angel One SmartAPI
-    'SmartAPIConfig', 'SmartAPIParser', 'AngelOneWebSocket',
-    # Replay
-    'ReplayConfig', 'ReplayAdapter', 'SnapshotRecorder', 'create_mock_snapshot',
+    "SmartAPIConfig",
+    "SmartAPIParser",
+    "AngelOneWebSocket",
+    "ReplayConfig",
+    "ReplayAdapter",
+    "SnapshotRecorder",
+    "create_mock_snapshot",
+    "MarketPattern",
+    "MarketScenarioConfig",
+    "TickMarketGenerator",
+    "generate_market_scenario",
+    "continue_market_scenario",
 ]

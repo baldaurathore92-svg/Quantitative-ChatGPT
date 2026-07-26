@@ -494,10 +494,16 @@ class QuantEngine:
             microprice_vol_window=self._config.threshold.microprice_vol_window
         )
         self._regime_config = RegimeConfig(
+            momentum_threshold=self._config.regime_detection.momentum_threshold,
+            obi_threshold=self._config.regime_detection.obi_threshold,
+            spread_threshold=self._config.regime_detection.spread_threshold,
+            vol_threshold=self._config.regime_detection.vol_threshold,
             momentum_window=self._config.buffer.momentum_window,
             obi_window=self._config.buffer.default_size,
             spread_window=self._config.buffer.spread_history_size,
-            price_window=self._config.buffer.price_history_size
+            price_window=self._config.buffer.price_history_size,
+            trend_persistence=self._config.regime_detection.trend_persistence,
+            noise_persistence=self._config.regime_detection.noise_persistence
         )
         self._composite_config = CompositeConfig(weights={
             'microprice': self._config.weights.microprice,
