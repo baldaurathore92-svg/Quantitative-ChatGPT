@@ -1,0 +1,99 @@
+{
+  "api": {
+    "api_key": "YOUR_API_KEY",
+    "auth_token": "YOUR_AUTH_TOKEN",
+    "client_code": "YOUR_CLIENT_CODE",
+    "feed_token": "YOUR_FEED_TOKEN",
+    "heartbeat_interval": 10.0,
+    "reconnect_delay": 5.0,
+    "max_reconnect_attempts": 10,
+    "snapshot_timeout": 30.0
+  },
+  "tick": {
+    "tick_size": 0.05,
+    "price_band_pct": 0.05
+  },
+  "spread": {
+    "max_spread_ticks": 100.0,
+    "compression_window": 20,
+    "compression_threshold": 0.5
+  },
+  "buffer": {
+    "default_size": 100,
+    "price_history_size": 50,
+    "spread_history_size": 30,
+    "momentum_window": 20
+  },
+  "ema": {
+    "short_tau": 5.0,
+    "medium_tau": 15.0,
+    "long_tau": 60.0,
+    "momentum_tau": 10.0
+  },
+  "weights": {
+    "microprice": 1.0,
+    "weighted_obi": 1.2,
+    "depth_slope": 0.6,
+    "spread_compression": 0.4,
+    "queue_persistence": 0.5,
+    "momentum": 0.8,
+    "acceleration": 0.4,
+    "refill_proxy": 0.3,
+    "ltp_confirmation": 0.2
+  },
+  "regime_weights": {
+    "trend": {
+      "microprice": 0.8,
+      "weighted_obi": 1.2,
+      "momentum": 1.3
+    },
+    "range": {
+      "microprice": 1.1,
+      "weighted_obi": 0.9,
+      "momentum": 0.7
+    },
+    "noise": {
+      "microprice": 1.0,
+      "weighted_obi": 1.0,
+      "momentum": 0.8
+    }
+  },
+  "threshold": {
+    "base_threshold": 0.6,
+    "min_threshold": 0.3,
+    "max_threshold": 0.9,
+    "volatility_multiplier": 0.2,
+    "spread_multiplier": 0.15,
+    "min_samples": 10,
+    "warmup_samples": 5
+  },
+  "state_machine": {
+    "warmup_samples": 10,
+    "watch_timeout_seconds": 5.0,
+    "cooldown_seconds": 3.0,
+    "min_hold_time": 1.0,
+    "signal_persistence": 3
+  },
+  "execution": {
+    "slippage_ticks": 1.0,
+    "max_depth_walk": 3,
+    "min_fill_ratio": 0.5,
+    "execution_cost_long": 0.01,
+    "execution_cost_short": 0.01
+  },
+  "confidence": {
+    "min_liquidity_qty": 100,
+    "max_spread_ticks": 20.0,
+    "min_queue_stability": 0.3,
+    "volatility_window": 20,
+    "base_confidence": 0.5
+  },
+  "logging": {
+    "level": "INFO",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    "file_path": "snapshot_quant.log",
+    "max_file_size": 10485760,
+    "backup_count": 5
+  },
+  "symbols": ["RELIANCE", "TCS", "INFY"]
+}
