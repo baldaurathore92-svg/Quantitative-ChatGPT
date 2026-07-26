@@ -1,5 +1,12 @@
 """Adapter package for live, replay, and deterministic simulation data."""
 
+from .adversarial_scenarios import (
+    AdversarialPattern,
+    AdversarialScenarioConfig,
+    AdversarialScenarioGenerator,
+    AdversarialTick,
+    generate_adversarial_scenario,
+)
 from .angel_v2 import AngelOneWebSocket, SmartAPIConfig, SmartAPIParser
 from .market_scenarios import (
     MarketPattern,
@@ -23,4 +30,9 @@ __all__ = [
     "TickMarketGenerator",
     "generate_market_scenario",
     "continue_market_scenario",
+    "AdversarialPattern",
+    "AdversarialScenarioConfig",
+    "AdversarialScenarioGenerator",
+    "AdversarialTick",
+    "generate_adversarial_scenario",
 ]
