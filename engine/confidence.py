@@ -14,11 +14,11 @@ Confidence depends on:
 - Volatility
 """
 
-from typing import Dict, Optional
+from typing import Optional
 from dataclasses import dataclass
 
-from utils.types import Snapshot, FeatureResult, RollingStats
-from utils.math_utils import clamp, safe_divide
+from utils.types import Snapshot, FeatureResult
+from utils.math_utils import clamp
 from utils.constants import (
     MIN_CONFIDENCE,
     HIGH_CONFIDENCE,

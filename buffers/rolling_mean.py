@@ -175,8 +175,11 @@ class TimeAwareRollingMean:
             self._initialized = True
             self._count = 1
         else:
-            # Calculate time delta
-            dt = timestamp - self._last_timestamp
+            # Calculate time delta after initialization established the timestamp.
+            last_timestamp = self._last_timestamp
+            if last_timestamp is None:
+                raise RuntimeError("initialized rolling mean has no timestamp")
+            dt = timestamp - last_timestamp
             if dt < 0:
                 # Timestamp went backwards - use small positive dt
                 dt = 0.001

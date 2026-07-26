@@ -14,11 +14,9 @@ We only see LTP and volume, not aggressor side.
 
 from typing import Optional, Tuple
 from dataclasses import dataclass
-import math
 
 from utils.types import Snapshot, PriceKeyedBook, FeatureResult, RollingStats
-from utils.math_utils import clamp, ticks_from_mid
-from utils.constants import EPSILON
+from utils.math_utils import clamp
 
 
 @dataclass

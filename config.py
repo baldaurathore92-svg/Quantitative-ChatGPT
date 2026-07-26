@@ -5,9 +5,11 @@ All configurable parameters loaded from config.json with sensible defaults.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, Any
+from typing import Dict, Any, List
 import json
 from pathlib import Path
+
+from utils.types import MarketSubscription
 
 
 @dataclass
@@ -21,6 +23,7 @@ class APIConfig:
     reconnect_delay: float = 5.0
     max_reconnect_attempts: int = 10
     snapshot_timeout: float = 30.0
+    correlation_id: str = "snapquote1"
 
 
 @dataclass
@@ -86,6 +89,12 @@ class RegimeWeights:
         'weighted_obi': 1.2,
         'momentum': 1.3,
         'acceleration': 1.0,
+    })
+    pullback: Dict[str, float] = field(default_factory=lambda: {
+        'microprice': 1.0,
+        'weighted_obi': 1.0,
+        'momentum': 0.8,
+        'acceleration': 1.2,
     })
     range: Dict[str, float] = field(default_factory=lambda: {
         'microprice': 1.1,
@@ -194,7 +203,7 @@ class EngineConfig:
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
-    symbols: list = field(default_factory=list)
+    subscriptions: List[MarketSubscription] = field(default_factory=list)
     
     @classmethod
     def from_json(cls, path: str) -> 'EngineConfig':
@@ -241,6 +250,7 @@ class EngineConfig:
             rw = data['regime_weights']
             config.regime_weights = RegimeWeights(
                 trend=rw.get('trend', config.regime_weights.trend),
+                pullback=rw.get('pullback', config.regime_weights.pullback),
                 range=rw.get('range', config.regime_weights.range),
                 noise=rw.get('noise', config.regime_weights.noise),
             )
@@ -248,7 +258,19 @@ class EngineConfig:
         if 'threshold' in data:
             config.threshold = ThresholdConfig(**{k: v for k, v in data['threshold'].items()
                                                    if k in ThresholdConfig.__dataclass_fields__})
-        
+
+        if 'regime_threshold' in data:
+            config.regime_threshold = RegimeThresholdConfig(**{
+                k: v for k, v in data['regime_threshold'].items()
+                if k in RegimeThresholdConfig.__dataclass_fields__
+            })
+
+        if 'regime_confidence' in data:
+            config.regime_confidence = RegimeConfidenceConfig(**{
+                k: v for k, v in data['regime_confidence'].items()
+                if k in RegimeConfidenceConfig.__dataclass_fields__
+            })
+
         if 'state_machine' in data:
             config.state_machine = StateMachineConfig(**{k: v for k, v in data['state_machine'].items()
                                                           if k in StateMachineConfig.__dataclass_fields__})
@@ -265,9 +287,15 @@ class EngineConfig:
             config.logging = LoggingConfig(**{k: v for k, v in data['logging'].items()
                                                if k in LoggingConfig.__dataclass_fields__})
         
-        if 'symbols' in data:
-            config.symbols = data['symbols']
-        
+        if 'subscriptions' in data:
+            raw_subscriptions = data['subscriptions']
+            if not isinstance(raw_subscriptions, list):
+                raise ValueError("subscriptions must be a list")
+            config.subscriptions = [
+                MarketSubscription.from_config(value)
+                for value in raw_subscriptions
+            ]
+
         return config
     
     def to_json(self, path: str) -> None:

@@ -4,7 +4,6 @@ Rolling variance with O(1) update.
 Uses Welford's online algorithm for numerical stability.
 """
 
-from typing import Optional
 from dataclasses import dataclass
 import math
 

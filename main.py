@@ -14,14 +14,14 @@ import sys
 import signal
 import time
 import argparse
-from typing import Optional
+from typing import Optional, Union
 
 from config import EngineConfig
 from engine.quant_engine import QuantEngine
 from adapter.angel_v2 import SmartAPIConfig, AngelOneWebSocket
 from adapter.replay import ReplayConfig, ReplayAdapter
-from utils.types import Snapshot, CompositeScore
-from utils.logging_utils import setup_logging, StructuredLogger
+from utils.types import Snapshot, CompositeScore, SnapshotDeliveryMode
+from utils.logging_utils import setup_logging
 
 
 class EngineRunner:
@@ -45,7 +45,9 @@ class EngineRunner:
         self._engine = QuantEngine(config)
         
         # Data source
-        self._data_source = None
+        self._data_source: Optional[
+            Union[AngelOneWebSocket, ReplayAdapter]
+        ] = None
         self._running = False
         self._processed_count = 0
         
@@ -68,7 +70,11 @@ class EngineRunner:
         if not self._config.api.auth_token:
             self._logger.error("Missing auth token in configuration")
             return False
-        
+
+        if not self._config.subscriptions:
+            self._logger.error("At least one live subscription is required")
+            return False
+
         # Create WebSocket adapter
         api_config = SmartAPIConfig(
             api_key=self._config.api.api_key,
@@ -77,32 +83,42 @@ class EngineRunner:
             feed_token=self._config.api.feed_token,
             heartbeat_interval=self._config.api.heartbeat_interval,
             reconnect_delay=self._config.api.reconnect_delay,
-            max_reconnect_attempts=self._config.api.max_reconnect_attempts
+            max_reconnect_attempts=self._config.api.max_reconnect_attempts,
+            snapshot_timeout=self._config.api.snapshot_timeout,
+            correlation_id=self._config.api.correlation_id,
         )
         
-        self._data_source = AngelOneWebSocket(api_config)
-        
-        # Set callbacks
-        self._data_source.on_snapshot = self._on_snapshot
-        self._data_source.on_error = self._on_error
-        self._data_source.on_connect = self._on_connect
-        self._data_source.on_disconnect = self._on_disconnect
-        
+        data_source = AngelOneWebSocket(
+            api_config,
+            delivery_mode=SnapshotDeliveryMode.PULL
+        )
+
+        # Lifecycle callbacks only; snapshots are owned by the main pull loop.
+        data_source.on_error = self._on_error
+        data_source.on_connect = self._on_connect
+        data_source.on_disconnect = self._on_disconnect
+
         # Connect
-        if not self._data_source.connect():
+        if not data_source.connect():
             self._logger.error("Failed to connect to data source")
             return False
         
-        # Subscribe to symbols
-        if self._config.symbols:
-            self._data_source.subscribe(self._config.symbols)
-        
+        # Subscribe to configured exchange segments and numeric instrument tokens.
+        if not data_source.subscribe(self._config.subscriptions):
+            self._logger.error("Failed to subscribe to configured tokens")
+            data_source.disconnect()
+            return False
+
+        self._data_source = data_source
         self._running = True
         self._start_time = time.time()
         
         self._logger.info(
             "Engine started (live)",
-            symbols=self._config.symbols
+            subscriptions=[
+                subscription.as_dict()
+                for subscription in self._config.subscriptions
+            ]
         )
         
         return True
@@ -125,30 +141,33 @@ class EngineRunner:
             skip_invalid=True
         )
         
-        self._data_source = ReplayAdapter(replay_config)
-        
-        # Set callbacks
-        self._data_source.on_snapshot = self._on_snapshot
-        self._data_source.on_error = self._on_error
-        self._data_source.on_connect = self._on_connect
-        self._data_source.on_disconnect = self._on_disconnect
-        
+        data_source = ReplayAdapter(
+            replay_config,
+            delivery_mode=SnapshotDeliveryMode.PULL
+        )
+
+        # Lifecycle callbacks only; snapshots are owned by the main pull loop.
+        data_source.on_error = self._on_error
+        data_source.on_connect = self._on_connect
+        data_source.on_disconnect = self._on_disconnect
+
         # Load and start
-        if not self._data_source.load():
+        if not data_source.load():
             self._logger.error("Failed to load replay data")
             return False
         
-        if not self._data_source.start():
+        if not data_source.start():
             self._logger.error("Failed to start replay")
             return False
-        
+
+        self._data_source = data_source
         self._running = True
         self._start_time = time.time()
         
         self._logger.info(
             "Engine started (replay)",
             file=file_path,
-            total_snapshots=self._data_source.total_snapshots
+            total_snapshots=data_source.total_snapshots
         )
         
         return True
@@ -159,7 +178,8 @@ class EngineRunner:
         
         Blocks until shutdown signal or data source ends.
         """
-        if not self._running:
+        data_source = self._data_source
+        if not self._running or data_source is None:
             self._logger.error("Engine not started")
             return
         
@@ -169,13 +189,13 @@ class EngineRunner:
         # Main loop
         while self._running:
             try:
-                snapshot = self._data_source.get_snapshot(timeout=1.0)
-                
+                snapshot = data_source.get_snapshot(timeout=1.0)
+
                 if snapshot:
                     self._process_snapshot(snapshot)
-                elif not self._data_source.is_connected:
-                    # Data source disconnected
-                    self._logger.info("Data source disconnected")
+                elif not data_source.is_connected and not data_source.running:
+                    # Replay completed or the live adapter exhausted retries.
+                    self._logger.info("Data source stopped")
                     break
                     
             except KeyboardInterrupt:
@@ -203,18 +223,16 @@ class EngineRunner:
                 regime=composite.regime.name
             )
         
-        # Check for actionable signal
-        if composite.is_actionable(composite.threshold_used):
-            self._handle_signal(snapshot, composite)
+        # The state-machine transition policy is authoritative for both entries
+        # and exits, including exits below the composite activation threshold.
+        self._handle_signal(snapshot, composite)
     
     def _handle_signal(self, snapshot: Snapshot, composite: CompositeScore) -> None:
-        """Handle actionable signal."""
-        self._signals_generated += 1
-        
-        # Get execution signal
+        """Emit a one-shot command created by the latest state transition."""
         exec_signal = self._engine.get_execution_signal(snapshot, composite)
-        
+
         if exec_signal:
+            self._signals_generated += 1
             self._logger.log_signal(
                 symbol=exec_signal.symbol,
                 signal_type=exec_signal.signal_type.name,

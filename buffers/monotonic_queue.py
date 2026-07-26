@@ -4,7 +4,7 @@ Monotonic queue for O(1) rolling min/max.
 Implements deque-based monotonic queue for efficient rolling statistics.
 """
 
-from typing import Generic, TypeVar, Optional, Tuple
+from typing import Generic, TypeVar, Optional
 from dataclasses import dataclass
 from collections import deque
 

@@ -15,10 +15,9 @@ This is a PROXY for queue stability based on:
 
 from typing import Optional, Dict, Tuple
 from dataclasses import dataclass
-import math
 
 from utils.types import Snapshot, PriceKeyedBook, FeatureResult, RollingStats, PriceLevel
-from utils.math_utils import clamp, safe_divide
+from utils.math_utils import clamp
 from utils.constants import QUEUE_PERSISTENCE_RANGE
 
 
@@ -161,7 +160,7 @@ class QueuePersistenceCalculator:
             return None, 0.0
         
         total_current = 0
-        total_persistent = 0
+        total_persistent = 0.0
         levels_checked = 0
         
         for i, level in enumerate(current_levels[:self._config.levels_to_track]):
@@ -230,7 +229,7 @@ class QueuePersistenceCalculator:
         Returns:
             Dict with 'bid' and 'ask' keys, each mapping price -> qty_change
         """
-        changes = {'bid': {}, 'ask': {}}
+        changes: Dict[str, Dict[float, int]] = {'bid': {}, 'ask': {}}
         
         for level in snapshot.bids[:self._config.levels_to_track]:
             prev_data = prev_book.bids.get(level.price)

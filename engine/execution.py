@@ -11,16 +11,14 @@ Real execution uses best ask + slippage for longs,
 best bid - slippage for shorts.
 """
 
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 from dataclasses import dataclass
 
-from utils.types import Snapshot, PriceLevel, ExecutionSignal, SignalType, Regime
-from utils.math_utils import clamp, safe_divide
+from utils.types import Snapshot, ExecutionSignal, SignalType, Regime
 from utils.constants import (
     DEFAULT_SLIPPAGE_TICKS,
     MAX_DEPTH_WALK,
-    MIN_FILL_RATIO,
-    EPSILON
+    MIN_FILL_RATIO
 )
 
 
@@ -57,6 +55,11 @@ class ExecutionModel:
     
     def __init__(self, config: ExecutionConfig):
         self._config = config
+
+    @staticmethod
+    def _validate_quantity(quantity: int) -> None:
+        if not isinstance(quantity, int) or isinstance(quantity, bool) or quantity <= 0:
+            raise ValueError("quantity must be a positive integer")
     
     def calculate_long_execution(
         self,
@@ -73,9 +76,12 @@ class ExecutionModel:
         Returns:
             Tuple of (execution_price, avg_price, fillable_qty)
         """
+        if quantity is not None:
+            self._validate_quantity(quantity)
+
         if not snapshot.is_valid():
             return 0.0, 0.0, 0
-        
+
         if quantity is None:
             # Single-level execution
             best_ask = snapshot.best_ask
@@ -103,9 +109,12 @@ class ExecutionModel:
         Returns:
             Tuple of (execution_price, avg_price, fillable_qty)
         """
+        if quantity is not None:
+            self._validate_quantity(quantity)
+
         if not snapshot.is_valid():
             return 0.0, 0.0, 0
-        
+
         if quantity is None:
             # Single-level execution
             best_bid = snapshot.best_bid
@@ -230,8 +239,8 @@ class ExecutionModel:
         # Slippage cost
         slippage_cost_pct = (self._config.slippage_ticks * self._config.tick_size / mid) * 100
         
-        # Fixed execution cost
-        if signal_type == SignalType.BULLISH:
+        # Fixed cost follows order side: buys use long cost, sells short cost.
+        if signal_type in (SignalType.BULLISH, SignalType.EXIT_SHORT):
             fixed_cost = self._config.execution_cost_long_pct
         else:
             fixed_cost = self._config.execution_cost_short_pct
@@ -247,34 +256,53 @@ class ExecutionModel:
         composite_value: float,
         confidence: float,
         regime: Regime,
-        timestamp: float
+        timestamp: float,
+        quantity: Optional[int] = None
     ) -> Optional[ExecutionSignal]:
         """
         Create execution signal from composite.
         
         Args:
             snapshot: Current snapshot
-            signal_type: BULLISH or BEARISH
+            signal_type: Entry or explicit position-exit command
             composite_value: Composite score value
             confidence: Signal confidence
             regime: Current market regime
             timestamp: Current timestamp
-        
+            quantity: Optional requested quantity for depth-aware execution
+
         Returns:
-            ExecutionSignal or None if invalid
+            ExecutionSignal or None if invalid or insufficiently fillable
         """
+        if quantity is not None:
+            self._validate_quantity(quantity)
+
         if not snapshot.is_valid():
             return None
         
         if signal_type == SignalType.NEUTRAL:
             return None
         
-        symbol = snapshot.symbol
-        
-        if signal_type == SignalType.BULLISH:
-            target_price, avg_price, fillable = self.calculate_long_execution(snapshot)
+        symbol = snapshot.instrument_key
+
+        if signal_type in (SignalType.BULLISH, SignalType.EXIT_SHORT):
+            if quantity is not None:
+                fill_ratio = self.estimate_fill_ratio(snapshot, quantity, 'ask')
+                if fill_ratio < self._config.min_fill_ratio:
+                    return None
+            target_price, _avg_price, _fillable = self.calculate_long_execution(
+                snapshot, quantity
+            )
+        elif signal_type in (SignalType.BEARISH, SignalType.EXIT_LONG):
+            if quantity is not None:
+                fill_ratio = self.estimate_fill_ratio(snapshot, quantity, 'bid')
+                if fill_ratio < self._config.min_fill_ratio:
+                    return None
+            target_price, _avg_price, _fillable = self.calculate_short_execution(
+                snapshot, quantity
+            )
         else:
-            target_price, avg_price, fillable = self.calculate_short_execution(snapshot)
+            return None
         
         if target_price <= 0:
             return None
@@ -288,7 +316,9 @@ class ExecutionModel:
             regime=regime,
             timestamp=timestamp,
             slippage_ticks=self._config.slippage_ticks,
-            max_depth_walk=self._config.max_depth_walk
+            max_depth_walk=self._config.max_depth_walk,
+            token=snapshot.token,
+            exchange_type=snapshot.exchange_type
         )
     
     def estimate_fill_ratio(
@@ -308,24 +338,29 @@ class ExecutionModel:
         Returns:
             Estimated fill ratio [0, 1]
         """
+        self._validate_quantity(quantity)
+        if not isinstance(side, str) or side.lower() not in {'bid', 'ask'}:
+            raise ValueError("side must be either 'bid' or 'ask'")
+
         if not snapshot.is_valid():
             return 0.0
-        
-        if side.lower() == 'ask':
+
+        normalized_side = side.lower()
+        if normalized_side == 'ask':
             # Buying, walking asks
             levels = snapshot.asks
         else:
             # Selling, walking bids
             levels = snapshot.bids
-        
+
         available_qty = sum(
             level.quantity for level in levels[:self._config.max_depth_walk]
         )
-        
+
         if available_qty <= 0:
             return 0.0
-        
-        return min(1.0, quantity / available_qty)
+
+        return min(1.0, available_qty / quantity)
     
     def get_execution_info(self, snapshot: Snapshot) -> dict:
         """Get execution information for snapshot."""

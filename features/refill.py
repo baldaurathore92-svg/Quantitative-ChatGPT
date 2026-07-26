@@ -20,13 +20,12 @@ A "refill" detection means:
 This suggests aggressive order flow followed by liquidity provision.
 """
 
-from typing import Optional, Dict, Tuple, List
+from typing import Optional, Dict, Tuple
 from dataclasses import dataclass
 from enum import Enum
-import math
 
 from utils.types import Snapshot, PriceKeyedBook, FeatureResult, RollingStats, PriceLevel
-from utils.math_utils import clamp, safe_divide
+from utils.math_utils import clamp
 from utils.constants import REFILL_PROXY_RANGE
 
 
@@ -270,29 +269,27 @@ class RefillProxyCalculator:
             elif state.state == RefillState.CONSUMED:
                 if current_qty < state.min_qty:
                     state.min_qty = current_qty
-                
-                # Check for recovery
-                if state.min_qty > 0:
+
+                # Expiry is independent of whether a recovery ratio is computable.
+                if timestamp - state.timestamp > self._config.max_age_seconds:
+                    state.state = RefillState.NEUTRAL
+                    state.min_qty = current_qty
+                elif state.min_qty > 0:
                     recovery = (current_qty - state.min_qty) / state.min_qty
-                    
+
                     if recovery >= self._config.recovery_threshold:
                         # Refill detected!
                         state.state = RefillState.RECOVERED
                         state.recovery_ratio = recovery
-                        
+
                         # Signal strength
                         strength = state.consumption_ratio * state.recovery_ratio
                         refill_detected += strength
-                        
+
                         # Reset to neutral after detection
                         state.state = RefillState.NEUTRAL
                         state.min_qty = current_qty
                         state.max_qty = current_qty
-                
-                # Check if consumption event is too old
-                elif timestamp - state.timestamp > self._config.max_age_seconds:
-                    state.state = RefillState.NEUTRAL
-                    state.min_qty = current_qty
             
             state.prev_qty = current_qty
             levels_analyzed += 1

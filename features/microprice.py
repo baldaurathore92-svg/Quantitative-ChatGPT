@@ -19,7 +19,7 @@ from typing import Optional, Tuple
 from dataclasses import dataclass
 
 from utils.types import Snapshot, PriceKeyedBook, FeatureResult, RollingStats
-from utils.math_utils import safe_divide, ticks_from_mid, clamp
+from utils.math_utils import clamp
 from utils.constants import MICROPRICE_TICK_RANGE
 
 
@@ -240,9 +240,6 @@ class MicropriceCalculator:
         levels = min(levels, snapshot.depth)
         if levels == 0:
             return snapshot.mid_price or 0.0, 0.0
-        
-        total_bid_qty = sum(level.quantity for level in snapshot.bids[:levels])
-        total_ask_qty = sum(level.quantity for level in snapshot.asks[:levels])
         
         # Weight each level by distance and quantity
         weighted_bid_sum = 0.0

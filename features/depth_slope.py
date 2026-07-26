@@ -11,11 +11,11 @@ This is a PROXY for order book depth quality.
 """
 
 import math
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 from dataclasses import dataclass
 
 from utils.types import Snapshot, PriceKeyedBook, FeatureResult, RollingStats, PriceLevel
-from utils.math_utils import clamp, linear_regression_slope, safe_divide
+from utils.math_utils import clamp, linear_regression_slope
 from utils.constants import DEPTH_SLOPE_RANGE
 
 

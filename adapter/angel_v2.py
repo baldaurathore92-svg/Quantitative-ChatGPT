@@ -1,32 +1,27 @@
-"""
-Angel One SmartAPI V2 WebSocket Adapter for Snapshot Mode 3.
+"""Angel One SmartAPI WebSocket V2 adapter for Mode 3 SnapQuote data."""
 
-Handles:
-- WebSocket connection management
-- Snapshot parsing (Mode 3 / SnapQuote)
-- Heartbeat handling
-- Reconnection logic
-- Payload format handling (dict and JSON)
-
-IMPORTANT: This adapter accepts ONLY Mode 3 (SnapQuote) data.
-Mode 1 (LTP only) and Mode 2 (Quote) are NOT supported.
-"""
+from __future__ import annotations
 
 import json
-import time
+import math
+import struct
 import threading
-from typing import Optional, Callable, Dict, Any, List
+import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from queue import Queue, Empty
-import socket
+from queue import Empty, Full, Queue
+from typing import Any, Callable, Optional
 
-from utils.types import Snapshot, PriceLevel
 from utils.logging_utils import StructuredLogger
+from utils.types import MarketSubscription, PriceLevel, Snapshot, SnapshotDeliveryMode
+
+SmartAPISubscription = MarketSubscription
 
 
-@dataclass
+@dataclass(frozen=True)
 class SmartAPIConfig:
-    """SmartAPI configuration."""
+    """Authentication and connection settings for SmartAPI WebSocket V2."""
+
     api_key: str
     auth_token: str
     client_code: str
@@ -35,585 +30,706 @@ class SmartAPIConfig:
     reconnect_delay: float = 5.0
     max_reconnect_attempts: int = 10
     snapshot_timeout: float = 30.0
+    correlation_id: str = "snapquote1"
+
+    def __post_init__(self) -> None:
+        required = {
+            "api_key": self.api_key,
+            "auth_token": self.auth_token,
+            "client_code": self.client_code,
+            "feed_token": self.feed_token,
+        }
+        for name, value in required.items():
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string")
+        if not isinstance(self.correlation_id, str) or not self.correlation_id.isalnum():
+            raise ValueError("correlation_id must be alphanumeric")
+        if not 1 <= len(self.correlation_id) <= 10:
+            raise ValueError("correlation_id must contain at most 10 characters")
+        if self.heartbeat_interval <= 0:
+            raise ValueError("heartbeat_interval must be positive")
+        if self.reconnect_delay < 0:
+            raise ValueError("reconnect_delay cannot be negative")
+        if self.max_reconnect_attempts < 0:
+            raise ValueError("max_reconnect_attempts cannot be negative")
+        if self.snapshot_timeout <= 0:
+            raise ValueError("snapshot_timeout must be positive")
 
 
 class SmartAPIParser:
-    """
-    Parse Angel One SmartAPI V2 Mode 3 (SnapQuote) responses.
-    
-    Mode 3 provides:
-    - Exchange (NSE/BSE)
-    - Trading Symbol
-    - Last Traded Price (LTP)
-    - Last Traded Quantity
-    - Volume Traded for the Day
-    - Total Buy Quantity
-    - Total Sell Quantity
-    - 5 Levels of Depth (Price, Quantity, Order Count)
-    
-    IMPORTANT: This parser handles BOTH dict and JSON string payloads.
-    """
-    
-    @staticmethod
-    def parse_snapquote(data: Any) -> Optional[Snapshot]:
-        """
-        Parse Mode 3 SnapQuote data.
-        
-        Accepts both dict and JSON string formats.
-        
-        Args:
-            data: Raw API response (dict or JSON string)
-        
-        Returns:
-            Snapshot if valid, None otherwise
-        """
-        # Handle JSON string
+    """Parse native V2 SnapQuote frames and explicit replay compatibility data."""
+
+    SNAP_QUOTE_MODE = 3
+    SNAP_QUOTE_PACKET_LENGTH = 379
+    TOKEN_START = 2
+    TOKEN_END = 27
+    BEST_FIVE_START = 147
+    BEST_FIVE_END = 347
+    DEPTH_ENTRY_LENGTH = 20
+    PRICE_SCALE = 100.0
+
+    @classmethod
+    def parse_snapquote(cls, data: Any) -> Optional[Snapshot]:
+        """Parse binary production data, or JSON/dict replay compatibility data."""
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            return cls.parse_binary_snapquote(bytes(data))
+        return cls.parse_compat_snapquote(data)
+
+    @classmethod
+    def parse_binary_snapquote(cls, frame: bytes) -> Optional[Snapshot]:
+        """Parse one little-endian 379-byte SmartAPI V2 Mode 3 frame safely."""
+        if not isinstance(frame, bytes) or len(frame) != cls.SNAP_QUOTE_PACKET_LENGTH:
+            return None
+
+        try:
+            mode = cls._unpack(frame, 0, "B")
+            exchange_type_value = cls._unpack(frame, 1, "B")
+            if mode != cls.SNAP_QUOTE_MODE:
+                return None
+            if (
+                isinstance(exchange_type_value, bool)
+                or not isinstance(exchange_type_value, int)
+                or exchange_type_value
+                not in MarketSubscription.SUPPORTED_EXCHANGE_TYPES
+            ):
+                return None
+            exchange_type = exchange_type_value
+
+            token = cls._parse_token(frame[cls.TOKEN_START:cls.TOKEN_END])
+            if token is None:
+                return None
+
+            sequence = cls._nonnegative_int(cls._unpack(frame, 27, "q"))
+            exchange_timestamp_ms = cls._nonnegative_int(cls._unpack(frame, 35, "q"))
+            ltp_raw = cls._nonnegative_int(cls._unpack(frame, 43, "q"))
+            ltp_quantity = cls._nonnegative_int(cls._unpack(frame, 51, "q"))
+            volume_traded = cls._nonnegative_int(cls._unpack(frame, 67, "q"))
+            total_buy_qty = cls._quantity_from_double(cls._unpack(frame, 75, "d"))
+            total_sell_qty = cls._quantity_from_double(cls._unpack(frame, 83, "d"))
+            last_traded_timestamp_ms = cls._nonnegative_int(cls._unpack(frame, 123, "q"))
+
+            if (
+                sequence is None
+                or exchange_timestamp_ms is None
+                or ltp_raw is None
+                or ltp_quantity is None
+                or volume_traded is None
+                or total_buy_qty is None
+                or total_sell_qty is None
+                or last_traded_timestamp_ms is None
+            ):
+                return None
+            if ltp_raw == 0:
+                return None
+
+            depth = cls._parse_best_five(frame[cls.BEST_FIVE_START:cls.BEST_FIVE_END])
+            if depth is None:
+                return None
+            bids, asks = depth
+
+            exchange_timestamp = cls._milliseconds_to_seconds(exchange_timestamp_ms)
+            traded_timestamp = cls._milliseconds_to_seconds(last_traded_timestamp_ms)
+            timestamp = exchange_timestamp or traded_timestamp
+            if timestamp <= 0:
+                return None
+
+            snapshot = Snapshot(
+                symbol=token,
+                token=token,
+                exchange_type=exchange_type,
+                timestamp=timestamp,
+                ltp=ltp_raw / cls.PRICE_SCALE,
+                ltp_quantity=ltp_quantity,
+                volume_traded=volume_traded,
+                total_buy_qty=total_buy_qty,
+                total_sell_qty=total_sell_qty,
+                bids=bids,
+                asks=asks,
+                sequence=sequence,
+                exchange_timestamp=exchange_timestamp,
+            )
+            return snapshot if snapshot.is_valid() else None
+        except (OverflowError, struct.error, TypeError, ValueError):
+            return None
+
+    @classmethod
+    def parse_compat_snapquote(cls, data: Any) -> Optional[Snapshot]:
+        """Parse explicit JSON/dict data used by tests and recorded replays."""
         if isinstance(data, str):
             try:
                 data = json.loads(data)
             except json.JSONDecodeError:
                 return None
-        
-        # Ensure we have a dict
-        if not isinstance(data, dict):
+        if not isinstance(data, Mapping):
             return None
-        
-        # Extract fields
+
         try:
-            # Token/symbol
-            symbol = data.get('symbol', data.get('token', ''))
+            token_value = data.get("token", "")
+            symbol_value = data.get("symbol", token_value)
+            symbol = str(symbol_value).strip()
+            token = str(token_value).strip()
+            exchange_type = int(
+                data.get("exchange_type", data.get("exchangeType", 0)) or 0
+            )
             if not symbol:
                 return None
-            
-            # LTP
-            ltp = float(data.get('ltp', 0))
-            if ltp <= 0:
-                return None
-            
-            # Timestamp
-            timestamp = float(data.get('timestamp', time.time()))
-            
-            # Volume fields
-            ltp_quantity = int(data.get('ltq', data.get('last_traded_quantity', 0)))
-            volume_traded = int(data.get('v', data.get('volume_trade_for_the_day', 0)))
-            total_buy_qty = int(data.get('tbq', data.get('total_buy_quantity', 0)))
-            total_sell_qty = int(data.get('tsq', data.get('total_sell_quantity', 0)))
-            
-            # Parse depth levels
-            bids = SmartAPIParser._parse_depth(data, 'bid', 'bids', 'bp', 'bq', 'bo')
-            asks = SmartAPIParser._parse_depth(data, 'ask', 'asks', 'sp', 'sq', 'so')
-            
-            # Sequence number
-            sequence = int(data.get('seq', data.get('sequence', 0)))
-            
-            # Exchange timestamp
-            exchange_ts = float(data.get('exch_ts', data.get('exchange_timestamp', 0)))
-            
-            return Snapshot(
-                symbol=str(symbol),
+
+            ltp = float(data.get("ltp", 0) or 0)
+            timestamp = float(data.get("timestamp", time.time()) or time.time())
+            snapshot = Snapshot(
+                symbol=symbol,
+                token=token,
+                exchange_type=exchange_type,
                 timestamp=timestamp,
                 ltp=ltp,
-                ltp_quantity=ltp_quantity,
-                volume_traded=volume_traded,
-                total_buy_qty=total_buy_qty,
-                total_sell_qty=total_sell_qty,
-                bids=tuple(bids),
-                asks=tuple(asks),
-                sequence=sequence,
-                exchange_timestamp=exchange_ts
+                ltp_quantity=int(
+                    data.get("ltq", data.get("last_traded_quantity", 0)) or 0
+                ),
+                volume_traded=int(
+                    data.get("v", data.get("volume_trade_for_the_day", 0)) or 0
+                ),
+                total_buy_qty=int(
+                    data.get("tbq", data.get("total_buy_quantity", 0)) or 0
+                ),
+                total_sell_qty=int(
+                    data.get("tsq", data.get("total_sell_quantity", 0)) or 0
+                ),
+                bids=tuple(cls._parse_compat_depth(data, "bid", "bids", "bp", "bq", "bo")),
+                asks=tuple(cls._parse_compat_depth(data, "ask", "asks", "sp", "sq", "so")),
+                sequence=int(data.get("seq", data.get("sequence", 0)) or 0),
+                exchange_timestamp=float(
+                    data.get("exch_ts", data.get("exchange_timestamp", 0)) or 0
+                ),
             )
-            
-        except (KeyError, ValueError, TypeError) as e:
+            return snapshot if snapshot.is_valid() else None
+        except (OverflowError, TypeError, ValueError):
             return None
-    
+
     @staticmethod
-    def _parse_depth(
-        data: dict,
-        side1: str,
-        side2: str,
+    def _unpack(frame: bytes, offset: int, format_code: str) -> int | float:
+        return struct.unpack_from(f"<{format_code}", frame, offset)[0]
+
+    @staticmethod
+    def _parse_token(raw_token: bytes) -> Optional[str]:
+        try:
+            token = raw_token.split(b"\x00", 1)[0].decode("ascii").strip()
+        except UnicodeDecodeError:
+            return None
+        if not token.isdecimal() or int(token) <= 0:
+            return None
+        return token
+
+    @staticmethod
+    def _nonnegative_int(value: int | float) -> Optional[int]:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        return value
+
+    @staticmethod
+    def _quantity_from_double(value: int | float) -> Optional[int]:
+        if not isinstance(value, float) or not math.isfinite(value) or value < 0:
+            return None
+        rounded = round(value)
+        if not math.isclose(value, rounded, abs_tol=1e-6):
+            return None
+        return int(rounded)
+
+    @staticmethod
+    def _milliseconds_to_seconds(value: int) -> float:
+        if value <= 0:
+            return 0.0
+        return value / 1000.0
+
+    @classmethod
+    def _parse_best_five(
+        cls,
+        depth_bytes: bytes,
+    ) -> Optional[tuple[tuple[PriceLevel, ...], tuple[PriceLevel, ...]]]:
+        if len(depth_bytes) != cls.BEST_FIVE_END - cls.BEST_FIVE_START:
+            return None
+
+        bids: list[PriceLevel] = []
+        asks: list[PriceLevel] = []
+        try:
+            for index in range(10):
+                offset = index * cls.DEPTH_ENTRY_LENGTH
+                side = cls._unpack(depth_bytes, offset, "H")
+                quantity = cls._nonnegative_int(cls._unpack(depth_bytes, offset + 2, "q"))
+                price_raw = cls._nonnegative_int(cls._unpack(depth_bytes, offset + 10, "q"))
+                order_count = cls._nonnegative_int(cls._unpack(depth_bytes, offset + 18, "H"))
+                if (
+                    side not in (0, 1)
+                    or quantity is None
+                    or price_raw is None
+                    or order_count is None
+                ):
+                    return None
+                if quantity == 0 or price_raw == 0:
+                    return None
+                level = PriceLevel(
+                    price=price_raw / cls.PRICE_SCALE,
+                    quantity=quantity,
+                    order_count=order_count,
+                )
+                # SmartAPI's official V2 decoder swaps the flag-labelled
+                # collections when exposing SnapQuote buy/sell depth: flag 0
+                # is effective sell depth and flag 1 is effective buy depth.
+                (asks if side == 0 else bids).append(level)
+        except (struct.error, TypeError, ValueError):
+            return None
+
+        if len(bids) != 5 or len(asks) != 5:
+            return None
+        bids.sort(key=lambda level: level.price, reverse=True)
+        asks.sort(key=lambda level: level.price)
+        return tuple(bids), tuple(asks)
+
+    @staticmethod
+    def _parse_compat_depth(
+        data: Mapping[str, Any],
+        side_name: str,
+        array_name: str,
         price_key: str,
-        qty_key: str,
-        orders_key: str
-    ) -> List[PriceLevel]:
-        """Parse depth levels from snapshot."""
-        levels = []
-        
-        # Try different field naming conventions
-        # API may use 'bp1', 'bp2', etc. or 'bids' array
-        
-        for i in range(1, 6):
+        quantity_key: str,
+        orders_key: str,
+    ) -> list[PriceLevel]:
+        levels: list[PriceLevel] = []
+        depth_array = data.get(array_name, [])
+        for index in range(1, 6):
             price = 0.0
-            qty = 0
+            quantity = 0
             orders = 0
-            
-            # Try array format first
-            depth_array = data.get(side2, [])
-            if isinstance(depth_array, list) and len(depth_array) >= i:
-                level_data = depth_array[i-1]
-                if isinstance(level_data, dict):
-                    price = float(level_data.get('price', level_data.get('p', 0)))
-                    qty = int(level_data.get('quantity', level_data.get('q', 0)))
-                    orders = int(level_data.get('orders', level_data.get('o', 0)))
-            
-            # Try indexed format
+            if isinstance(depth_array, list) and len(depth_array) >= index:
+                raw_level = depth_array[index - 1]
+                if isinstance(raw_level, Mapping):
+                    price = float(raw_level.get("price", raw_level.get("p", 0)) or 0)
+                    quantity = int(
+                        raw_level.get("quantity", raw_level.get("q", 0)) or 0
+                    )
+                    orders = int(raw_level.get("orders", raw_level.get("o", 0)) or 0)
             if price <= 0:
-                price = float(data.get(f'{price_key}{i}', data.get(f'{side1[0]}p{i}', 0)))
-            if qty <= 0:
-                qty = int(data.get(f'{qty_key}{i}', data.get(f'{side1[0]}q{i}', 0)))
+                price = float(
+                    data.get(f"{price_key}{index}", data.get(f"{side_name[0]}p{index}", 0))
+                    or 0
+                )
+            if quantity <= 0:
+                quantity = int(
+                    data.get(
+                        f"{quantity_key}{index}",
+                        data.get(f"{side_name[0]}q{index}", 0),
+                    )
+                    or 0
+                )
             if orders <= 0:
-                orders = int(data.get(f'{orders_key}{i}', data.get(f'{side1[0]}o{i}', 0)))
-            
-            if price > 0 and qty > 0:
-                levels.append(PriceLevel(price=price, quantity=qty, order_count=orders))
-        
+                orders = int(
+                    data.get(
+                        f"{orders_key}{index}",
+                        data.get(f"{side_name[0]}o{index}", 0),
+                    )
+                    or 0
+                )
+            if price > 0 and quantity > 0:
+                levels.append(PriceLevel(price=price, quantity=quantity, order_count=orders))
         return levels
 
 
 class AngelOneWebSocket:
-    """
-    WebSocket adapter for Angel One SmartAPI V2.
-    
-    Features:
-    - Mode 3 (SnapQuote) subscription
-    - Heartbeat handling
-    - Reconnection with loop (never recursive)
-    - Dict and JSON payload handling
-    - Thread-safe message queue
-    
-    USAGE:
-        config = SmartAPIConfig(api_key='...', auth_token='...', ...)
-        ws = AngelOneWebSocket(config)
-        
-        ws.on_snapshot = my_callback
-        
-        if ws.connect():
-            ws.subscribe(['RELIANCE', 'TCS'])
-            # Process messages
-            while running:
-                snapshot = ws.get_snapshot(timeout=1.0)
-                if snapshot:
-                    # Process snapshot
-                    pass
-        
-        ws.disconnect()
-    """
-    
-    def __init__(self, config: SmartAPIConfig):
+    """Thread-safe SmartAPI V2 WebSocket client with exclusive delivery modes."""
+
+    URL = "wss://smartapisocket.angelone.in/smart-stream"
+    SNAP_QUOTE_MODE = 3
+    SUBSCRIBE_ACTION = 1
+    UNSUBSCRIBE_ACTION = 0
+
+    def __init__(
+        self,
+        config: SmartAPIConfig,
+        delivery_mode: SnapshotDeliveryMode = SnapshotDeliveryMode.PULL,
+    ) -> None:
+        if not isinstance(delivery_mode, SnapshotDeliveryMode):
+            raise ValueError("delivery_mode must be a SnapshotDeliveryMode")
         self._config = config
-        self._logger = StructuredLogger('AngelOneWebSocket')
-        
-        # Connection state with thread-safe lock
-        self._state_lock = threading.Lock()
+        self._delivery_mode = delivery_mode
+        self._logger = StructuredLogger("AngelOneWebSocket")
+        self._state_lock = threading.RLock()
         self._connected = False
-        self._reconnect_count = 0
-        self._ws = None
-        self._ws_thread = None
         self._running = False
-        
-        # Message queue
-        self._message_queue: Queue = Queue(maxsize=1000)
-        
-        # Callbacks
+        self._reconnect_count = 0
+        self._ws: Any = None
+        self._ws_thread: Optional[threading.Thread] = None
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._message_queue: Queue[Snapshot] = Queue(maxsize=1000)
+        self._subscriptions: tuple[MarketSubscription, ...] = ()
+        now = time.monotonic()
+        self._last_heartbeat = now
+        self._last_snapshot = now
+        self._stale_close_requested = False
+        self._parser = SmartAPIParser()
+
         self.on_snapshot: Optional[Callable[[Snapshot], None]] = None
         self.on_error: Optional[Callable[[Exception], None]] = None
         self.on_connect: Optional[Callable[[], None]] = None
         self.on_disconnect: Optional[Callable[[], None]] = None
-        
-        # Subscriptions
-        self._subscribed_symbols: List[str] = []
-        
-        # Last heartbeat
-        self._last_heartbeat = time.time()
-        
-        # Heartbeat thread reference
-        self._heartbeat_thread: Optional[threading.Thread] = None
-        
-        # Parser
-        self._parser = SmartAPIParser()
-    
+
     @property
     def connected(self) -> bool:
-        """Thread-safe check for connection status."""
         with self._state_lock:
             return self._connected
-    
+
     @property
     def running(self) -> bool:
-        """Thread-safe check for running status."""
         with self._state_lock:
             return self._running
-    
+
+    @property
+    def is_connected(self) -> bool:
+        return self.connected
+
+    @property
+    def delivery_mode(self) -> SnapshotDeliveryMode:
+        return self._delivery_mode
+
+    @property
+    def queued_messages(self) -> int:
+        return self._message_queue.qsize()
+
+    @property
+    def subscriptions(self) -> tuple[MarketSubscription, ...]:
+        with self._state_lock:
+            return self._subscriptions
+
     def connect(self) -> bool:
-        """
-        Connect to WebSocket.
-        
-        Returns True if connected successfully.
-        """
+        """Construct the authenticated WebSocketApp and wait for connection."""
         try:
-            # Import WebSocket library
-            try:
-                import websocket
-            except ImportError:
-                self._logger.error("websocket-client not installed. Run: pip install websocket-client")
-                return False
-            
-            # WebSocket URL for Angel One
-            ws_url = self._build_ws_url()
-            
+            import websocket  # type: ignore[import-not-found]
+        except ImportError:
+            self._logger.error("websocket-client is not installed")
+            return False
+
+        with self._state_lock:
+            if self._running:
+                return self._connected
             self._running = True
+            self._reconnect_count = 0
             self._ws = websocket.WebSocketApp(
-                ws_url,
+                self.URL,
+                header=self._auth_headers(),
                 on_open=self._on_open,
                 on_message=self._on_message,
                 on_error=self._on_error,
-                on_close=self._on_close
+                on_close=self._on_close,
             )
-            
-            # Start WebSocket thread
-            self._ws_thread = threading.Thread(target=self._run_forever, daemon=True)
-            self._ws_thread.start()
-            
-            # Wait for connection
-            timeout = 10.0
-            start = time.time()
-            while not self.connected and time.time() - start < timeout:
-                time.sleep(0.1)
-            
-            return self.connected
-            
-        except Exception as e:
-            self._logger.error(f"Connection error: {e}")
-            return False
-    
-    def _build_ws_url(self) -> str:
-        """Build WebSocket URL."""
-        # Angel One SmartAPI WebSocket URL
-        # Format: wss://smartapisocket.angelone.in/smart-stream
-        base_url = "wss://smartapisocket.angelone.in/smart-stream"
-        return base_url
-    
+            ws_thread = threading.Thread(
+                target=self._run_forever,
+                name="angel-websocket",
+                daemon=True,
+            )
+            self._ws_thread = ws_thread
+
+        ws_thread.start()
+        self._start_heartbeat_monitor()
+
+        deadline = time.monotonic() + 10.0
+        while not self.connected and self.running and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if self.connected:
+            return True
+        self.disconnect()
+        return False
+
+    def _auth_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": self._config.auth_token,
+            "x-api-key": self._config.api_key,
+            "x-client-code": self._config.client_code,
+            "x-feed-token": self._config.feed_token,
+        }
+
     def _run_forever(self) -> None:
-        """Run WebSocket connection loop (never recursive reconnect)."""
         while self.running:
-            try:
-                self._ws.run_forever()
-            except Exception as e:
-                self._logger.error(f"WebSocket error: {e}")
-            
-            # Check if we should reconnect
-            if self.running and self._reconnect_count < self._config.max_reconnect_attempts:
-                self._reconnect_count += 1
-                self._logger.info(f"Reconnecting attempt {self._reconnect_count}")
-                time.sleep(self._config.reconnect_delay)
-            elif self.running:
-                self._logger.error("Max reconnect attempts reached")
-                with self._state_lock:
-                    self._running = False
+            with self._state_lock:
+                ws = self._ws
+            if ws is None:
                 break
-    
-    def _on_open(self, ws) -> None:
-        """Handle WebSocket open."""
+            try:
+                ws.run_forever()
+            except Exception as exc:
+                self._notify_error(exc)
+
+            with self._state_lock:
+                if not self._running:
+                    break
+                if self._reconnect_count >= self._config.max_reconnect_attempts:
+                    self._running = False
+                    exhausted = True
+                else:
+                    self._reconnect_count += 1
+                    attempt = self._reconnect_count
+                    exhausted = False
+            if exhausted:
+                self._notify_error(RuntimeError("maximum reconnect attempts reached"))
+                break
+            self._logger.info(f"Reconnecting attempt {attempt}")
+            time.sleep(self._config.reconnect_delay)
+
+    def _on_open(self, ws: Any) -> None:
+        now = time.monotonic()
         with self._state_lock:
             self._connected = True
-        self._reconnect_count = 0
-        self._last_heartbeat = time.time()
-        
+            self._reconnect_count = 0
+            self._last_heartbeat = now
+            self._last_snapshot = now
+            self._stale_close_requested = False
+            subscriptions = self._subscriptions
         self._logger.info("WebSocket connected")
-        
-        # Send authentication
-        self._send_auth()
-        
-        # Re-subscribe to symbols
-        if self._subscribed_symbols:
-            self._subscribe_internal(self._subscribed_symbols)
-        
-        # Start heartbeat thread
-        self._start_heartbeat()
-        
-        if self.on_connect:
+        if subscriptions:
+            self._subscribe_internal(subscriptions, self.SUBSCRIBE_ACTION)
+        if self.on_connect is not None:
             self.on_connect()
-    
-    def _on_close(self, ws, close_status_code, close_msg) -> None:
-        """Handle WebSocket close."""
-        was_connected = self._connected
-        self._connected = False
-        
+
+    def _on_close(self, ws: Any, close_status_code: Any, close_msg: Any) -> None:
+        with self._state_lock:
+            was_connected = self._connected
+            self._connected = False
+            self._stale_close_requested = False
         self._logger.info(f"WebSocket closed: {close_status_code} - {close_msg}")
-        
-        # Clear message queue on disconnect
-        while not self._message_queue.empty():
+        self._clear_message_queue()
+        if was_connected and self.on_disconnect is not None:
+            self.on_disconnect()
+
+    def _on_error(self, ws: Any, error: Any) -> None:
+        exception = error if isinstance(error, Exception) else RuntimeError(str(error))
+        self._notify_error(exception)
+
+    def _on_message(self, ws: Any, message: Any) -> None:
+        if isinstance(message, str):
+            if message.strip().lower() == "pong":
+                with self._state_lock:
+                    self._last_heartbeat = time.monotonic()
+                return
+            try:
+                control = json.loads(message)
+            except json.JSONDecodeError:
+                self._logger.warning("Invalid JSON compatibility message")
+                return
+            if isinstance(control, Mapping) and self._handle_control_message(control):
+                return
+            snapshot = self._parser.parse_compat_snapquote(control)
+        elif isinstance(message, Mapping):
+            if self._handle_control_message(message):
+                return
+            snapshot = self._parser.parse_compat_snapquote(message)
+        elif isinstance(message, (bytes, bytearray, memoryview)):
+            snapshot = self._parser.parse_binary_snapquote(bytes(message))
+        else:
+            snapshot = None
+
+        if snapshot is None:
+            self._logger.warning("Rejected malformed or unsupported WebSocket frame")
+            return
+        with self._state_lock:
+            self._last_snapshot = time.monotonic()
+            self._last_heartbeat = self._last_snapshot
+        self._deliver(snapshot)
+
+    def _handle_control_message(self, message: Mapping[str, Any]) -> bool:
+        message_type = str(message.get("type", message.get("t", ""))).lower()
+        if message_type in {"hb", "heartbeat", "pong"}:
+            with self._state_lock:
+                self._last_heartbeat = time.monotonic()
+            return True
+        if message_type == "error" or message.get("errorcode"):
+            code = message.get("code", message.get("errorcode", ""))
+            detail = message.get("message", message.get("msg", "Unknown error"))
+            self._notify_error(RuntimeError(f"{code}: {detail}"))
+            return True
+        return False
+
+    def _deliver(self, snapshot: Snapshot) -> None:
+        if self._delivery_mode == SnapshotDeliveryMode.CALLBACK:
+            if self.on_snapshot is not None:
+                try:
+                    self.on_snapshot(snapshot)
+                except Exception as exc:
+                    self._notify_error(exc)
+            return
+
+        try:
+            self._message_queue.put_nowait(snapshot)
+        except Full:
             try:
                 self._message_queue.get_nowait()
-            except Exception:
-                break
-        
-        if self.on_disconnect and was_connected:
-            self.on_disconnect()
-    
-    def _send_auth(self) -> None:
-        """Send authentication message."""
-        # Angel One SmartAPI V2 WebSocket authentication format
-        # Reference: https://smartapi.angelone.in/docs/websocket
-        auth_msg = {
-            "action": 1,  # Subscribe action
-            "params": {
-                "mode": 3,  # Mode 3 (SnapQuote)
-                "tokenKeys": []
-            },
-            "jwttoken": self._config.auth_token,
-            "clientcode": self._config.client_code,
-            "key": self._config.api_key
-        }
-        
-        self._send_json(auth_msg)
-    
-    def subscribe(self, symbols: List[str]) -> bool:
-        """
-        Subscribe to symbols.
-        
-        Args:
-            symbols: List of trading symbols (e.g., ['RELIANCE', 'TCS'])
-        
-        Returns:
-            True if subscription sent successfully
-        """
-        self._subscribed_symbols = symbols
-        
-        if not self._connected:
-            return False
-        
-        return self._subscribe_internal(symbols)
-    
-    def _subscribe_internal(self, symbols: List[str]) -> bool:
-        """Internal subscribe."""
-        try:
-            # Angel One SmartAPI V2 subscription format
-            # Note: Uses token list, not symbol names directly
-            # In production, you would map symbols to tokens first
-            token_keys = []
-            for symbol in symbols:
-                token_keys.append({
-                    "tokenType": "NSE",  # NSE Cash
-                    "tokens": [symbol]    # Token/symbol identifier
-                })
-            
-            sub_msg = {
-                "action": 1,  # Subscribe
-                "params": {
-                    "mode": 3,  # Mode 3 (SnapQuote)
-                    "tokenKeys": token_keys
-                }
-            }
-            
-            self._send_json(sub_msg)
-            return True
-            
-        except Exception as e:
-            self._logger.error(f"Subscribe error: {e}")
-            return False
-    
-    def _on_message(self, ws, message) -> None:
-        """Handle incoming message."""
-        try:
-            # Parse message
-            data = json.loads(message) if isinstance(message, str) else message
-            
-            # Check message type
-            msg_type = data.get('type', data.get('t', ''))
-            
-            if msg_type == 'hb' or msg_type == 'heartbeat':
-                # Heartbeat response
-                self._last_heartbeat = time.time()
-                return
-            
-            if msg_type == 'error':
-                # Error message
-                error_msg = data.get('message', data.get('msg', 'Unknown error'))
-                error_code = data.get('code', data.get('errorcode', ''))
-                self._logger.error(f"API error: {error_code} - {error_msg}")
-                if self.on_error:
-                    self.on_error(Exception(f"{error_code}: {error_msg}"))
-                return
-            
-            # Parse as snapshot
-            snapshot = self._parser.parse_snapquote(data)
-            
-            if snapshot:
-                # Put in queue (thread-safe)
-                try:
-                    self._message_queue.put_nowait(snapshot)
-                except Exception:
-                    # Queue full, drop oldest and retry
-                    try:
-                        self._message_queue.get_nowait()
-                        self._message_queue.put_nowait(snapshot)
-                    except Exception:
-                        pass  # Queue operations failed, skip this snapshot
-                
-                # Callback
-                if self.on_snapshot:
-                    try:
-                        self.on_snapshot(snapshot)
-                    except Exception as e:
-                        self._logger.error(f"Callback error: {e}")
-            else:
-                # Unrecognized message format - log for debugging
-                self._logger.debug(f"Unrecognized message: {str(data)[:100]}")
-            
-        except json.JSONDecodeError as e:
-            self._logger.warning(f"Invalid JSON message: {str(message)[:100]}")
-        except KeyError as e:
-            self._logger.warning(f"Missing expected field: {e}")
-        except ValueError as e:
-            self._logger.warning(f"Value error in message: {e}")
-        except TypeError as e:
-            self._logger.warning(f"Type error in message: {e}")
-        except Exception as e:
-            self._logger.error(f"Unexpected message handling error: {e}")
-    
-    def _on_error(self, ws, error) -> None:
-        """Handle WebSocket error."""
-        self._logger.error(f"WebSocket error: {error}")
-        if self.on_error:
-            self.on_error(error)
-    
+                self._message_queue.put_nowait(snapshot)
+            except (Empty, Full):
+                self._logger.warning("Snapshot queue remained full; dropped snapshot")
 
-    
-    def _send_json(self, data: dict) -> bool:
-        """
-        Send JSON message.
-        
-        Returns:
-            True if sent successfully, False otherwise
-        """
-        if not self._ws:
-            self._logger.warning("WebSocket not initialized")
-            return False
-        
-        if not self._connected:
-            self._logger.warning("WebSocket not connected")
-            return False
-        
+    def subscribe(self, subscriptions: Sequence[Any]) -> bool:
+        """Validate exchange/token subscriptions and send a Mode 3 request."""
         try:
-            self._ws.send(json.dumps(data))
-            return True
-        except Exception as e:
-            self._logger.error(f"Send error: {e}")
+            normalized = self._normalize_subscriptions(subscriptions)
+        except (TypeError, ValueError) as exc:
+            self._logger.error(f"Invalid subscription: {exc}")
             return False
-    
-    def _start_heartbeat(self) -> None:
-        """Start heartbeat thread with timeout detection."""
-        def heartbeat_loop():
-            missed_heartbeats = 0
-            max_missed = 3  # Max missed heartbeats before considering dead
-            
-            while self._running and self._connected:
-                try:
-                    # Check for heartbeat timeout
-                    time_since_last = time.time() - self._last_heartbeat
-                    expected_interval = self._config.heartbeat_interval * 2  # Allow 2x tolerance
-                    
-                    if time_since_last > expected_interval:
-                        missed_heartbeats += 1
-                        self._logger.warning(
-                            f"Heartbeat timeout: {time_since_last:.1f}s since last response "
-                            f"(missed: {missed_heartbeats}/{max_missed})"
-                        )
-                        
-                        if missed_heartbeats >= max_missed:
-                            self._logger.error("Max missed heartbeats - connection likely dead")
-                            # Force reconnection by closing
-                            if self._ws:
-                                try:
-                                    self._ws.close()
-                                except Exception:
-                                    pass
-                            break
-                    else:
-                        missed_heartbeats = 0  # Reset on successful heartbeat
-                    
-                    # Send heartbeat
-                    hb_msg = {"action": 0, "type": "hb"}
-                    self._send_json(hb_msg)
-                    time.sleep(self._config.heartbeat_interval)
-                    
-                except Exception as e:
-                    self._logger.error(f"Heartbeat error: {e}")
-                    break
-        
-        self._heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
-        self._heartbeat_thread.start()
-    
-    def unsubscribe(self, symbols: List[str]) -> bool:
-        """Unsubscribe from symbols."""
+        with self._state_lock:
+            self._subscriptions = normalized
+            connected = self._connected
+        if not connected:
+            return False
+        return self._subscribe_internal(normalized, self.SUBSCRIBE_ACTION)
+
+    def unsubscribe(self, subscriptions: Sequence[Any]) -> bool:
+        """Unsubscribe validated exchange/token pairs and update reconnect state."""
         try:
-            token_keys = []
-            for symbol in symbols:
-                token_keys.append({
-                    "tokenType": "NSE",
-                    "tokens": [symbol]
-                })
-            
-            unsub_msg = {
-                "action": 0,  # Unsubscribe
-                "params": {
-                    "mode": 3,
-                    "tokenKeys": token_keys
-                }
-            }
-            
-            self._send_json(unsub_msg)
-            
-            # Update subscribed list
-            self._subscribed_symbols = [s for s in self._subscribed_symbols if s not in symbols]
-            return True
-            
-        except Exception as e:
-            self._logger.error(f"Unsubscribe error: {e}")
+            normalized = self._normalize_subscriptions(subscriptions)
+        except (TypeError, ValueError) as exc:
+            self._logger.error(f"Invalid subscription: {exc}")
             return False
-    
+        if not self.connected:
+            return False
+        if not self._subscribe_internal(normalized, self.UNSUBSCRIBE_ACTION):
+            return False
+        remove = set(normalized)
+        with self._state_lock:
+            self._subscriptions = tuple(
+                subscription
+                for subscription in self._subscriptions
+                if subscription not in remove
+            )
+        return True
+
+    @staticmethod
+    def _normalize_subscriptions(
+        subscriptions: Sequence[Any],
+    ) -> tuple[MarketSubscription, ...]:
+        if isinstance(subscriptions, (str, bytes, bytearray)):
+            raise TypeError("subscriptions must contain exchange/token objects")
+        normalized = tuple(
+            MarketSubscription.from_config(subscription)
+            for subscription in subscriptions
+        )
+        if not normalized:
+            raise ValueError("at least one subscription is required")
+        return tuple(dict.fromkeys(normalized))
+
+    def _subscribe_internal(
+        self,
+        subscriptions: Sequence[MarketSubscription],
+        action: int = SUBSCRIBE_ACTION,
+    ) -> bool:
+        grouped: dict[int, list[str]] = {}
+        for subscription in subscriptions:
+            grouped.setdefault(subscription.exchange_type, []).append(subscription.token)
+        payload = {
+            "correlationID": self._config.correlation_id,
+            "action": action,
+            "params": {
+                "mode": self.SNAP_QUOTE_MODE,
+                "tokenList": [
+                    {"exchangeType": exchange_type, "tokens": tokens}
+                    for exchange_type, tokens in grouped.items()
+                ],
+            },
+        }
+        return self._send_json(payload)
+
+    def _send_json(self, data: Mapping[str, Any]) -> bool:
+        return self._send_text(json.dumps(data, separators=(",", ":")))
+
+    def _send_text(self, message: str) -> bool:
+        with self._state_lock:
+            ws = self._ws
+            connected = self._connected
+        if ws is None or not connected:
+            return False
+        try:
+            ws.send(message)
+            return True
+        except Exception as exc:
+            self._notify_error(exc)
+            return False
+
+    def _start_heartbeat_monitor(self) -> None:
+        with self._state_lock:
+            current = self._heartbeat_thread
+            if current is not None and current.is_alive():
+                return
+            heartbeat_thread = threading.Thread(
+                target=self._heartbeat_loop,
+                name="angel-heartbeat",
+                daemon=True,
+            )
+            self._heartbeat_thread = heartbeat_thread
+        heartbeat_thread.start()
+
+    def _heartbeat_loop(self) -> None:
+        while self.running:
+            time.sleep(self._config.heartbeat_interval)
+            with self._state_lock:
+                connected = self._connected
+                has_subscriptions = bool(self._subscriptions)
+                last_snapshot = self._last_snapshot
+                stale_close_requested = self._stale_close_requested
+                ws = self._ws
+            if not connected:
+                continue
+            if has_subscriptions:
+                stale_for = time.monotonic() - last_snapshot
+                if stale_for > self._config.snapshot_timeout and not stale_close_requested:
+                    with self._state_lock:
+                        self._stale_close_requested = True
+                    self._notify_error(
+                        TimeoutError(f"snapshot stream stale for {stale_for:.1f} seconds")
+                    )
+                    if ws is not None:
+                        try:
+                            ws.close()
+                        except Exception as exc:
+                            self._notify_error(exc)
+                    continue
+            self._send_text("ping")
+
     def get_snapshot(self, timeout: float = 1.0) -> Optional[Snapshot]:
-        """
-        Get next snapshot from queue.
-        
-        Args:
-            timeout: Max wait time in seconds
-        
-        Returns:
-            Snapshot or None if timeout
-        """
+        """Return the next snapshot only for pull delivery."""
+        if self._delivery_mode != SnapshotDeliveryMode.PULL:
+            return None
         try:
             return self._message_queue.get(timeout=timeout)
         except Empty:
             return None
-    
+
     def disconnect(self) -> None:
-        """Disconnect WebSocket (thread-safe)."""
+        """Stop reconnect/heartbeat loops and close the current connection."""
         with self._state_lock:
             self._running = False
             self._connected = False
-        
-        if self._ws:
+            ws = self._ws
+            ws_thread = self._ws_thread
+            heartbeat_thread = self._heartbeat_thread
+        if ws is not None:
             try:
-                self._ws.close()
-            except Exception:
-                pass
-        
-        # Wait for threads to finish
-        if self._ws_thread and self._ws_thread.is_alive():
-            self._ws_thread.join(timeout=2.0)
-        
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            self._heartbeat_thread.join(timeout=1.0)
-        
+                ws.close()
+            except Exception as exc:
+                self._notify_error(exc)
+
+        current_thread = threading.current_thread()
+        if ws_thread is not None and ws_thread is not current_thread and ws_thread.is_alive():
+            ws_thread.join(timeout=2.0)
+        if (
+            heartbeat_thread is not None
+            and heartbeat_thread is not current_thread
+            and heartbeat_thread.is_alive()
+        ):
+            heartbeat_thread.join(timeout=min(1.0, self._config.heartbeat_interval))
         self._logger.info("WebSocket disconnected")
-    
-    @property
-    def is_connected(self) -> bool:
-        """Check if connected."""
-        return self._connected
-    
-    @property
-    def queued_messages(self) -> int:
-        """Get number of queued messages."""
-        return self._message_queue.qsize()
+
+    def _clear_message_queue(self) -> None:
+        while True:
+            try:
+                self._message_queue.get_nowait()
+            except Empty:
+                return
+
+    def _notify_error(self, error: Exception) -> None:
+        self._logger.error(f"WebSocket error: {error}")
+        if self.on_error is not None:
+            self.on_error(error)
